@@ -15,8 +15,6 @@ from linebot.models import MessageEvent, ImageMessage, TextSendMessage
 import gspread
 from google.oauth2.service_account import Credentials
 
-import re
-
 
 # ---------- Config ----------
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
@@ -78,31 +76,10 @@ def append_ocr_to_sheet(user_id: str, ocr_text: str, image_id: str = "") -> None
     try:
         ws = sh.worksheet(WORKSHEET_NAME)
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=WORKSHEET_NAME, rows=200, cols=10)
-        ws.append_row(
-            ["timestamp", "user_id", "line_image_message_id", "ocr_text",
-             "amount", "tx_date", "vendor", "category", "account_code", "confidence"],
-            value_input_option="RAW"
-        )
-
-    # 追加: OCRテキストの後処理
-    amount = extract_amount(ocr_text)
-    tx_date = extract_date(ocr_text)
-    vendor = extract_vendor(ocr_text)
-    category, account_code, confidence = classify_category(ocr_text)
-
+        ws = sh.add_worksheet(title=WORKSHEET_NAME, rows=100, cols=4)
+        ws.append_row(["timestamp", "user_id", "line_image_message_id", "ocr_text"], value_input_option="RAW")
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    ws.append_row(
-        [
-            ts, user_id, image_id, ocr_text,
-            amount if amount is not None else "",
-            tx_date if tx_date else "",
-            vendor if vendor else "",
-            category, account_code, round(confidence, 2)
-        ],
-        value_input_option="RAW"
-    )
-
+    ws.append_row([ts, user_id, image_id, ocr_text], value_input_option="RAW")
 
 # ---------- OCR (Google Vision API) ----------
 def ocr_image_by_vision(image_bytes: bytes) -> str:
@@ -217,60 +194,6 @@ def handle_image(event: MessageEvent):
             event.reply_token,
             TextSendMessage(text=f"想定外のエラー: {e}")
         )
-
-
-# OCRテキストの抽出・分類ユーティリティ
-AMOUNT_PAT = re.compile(r"(¥|￥)?\s*([0-9]{1,3}(?:[,，][0-9]{3})+|[0-9]+)\s*(円)?")
-DATE_PAT = re.compile(r"(?:(20\d{2})[./年-](\d{1,2})[./月-](\d{1,2})日?)")
-VENDOR_PAT = re.compile(r"(株式会社|有限会社|カブシキガイシャ)[^\s\n\r]{1,20}|[A-Za-z0-9&'().\-]{3,}\s?(?:Store|SHOP|Cafe|CO|INC|LTD)\b", re.IGNORECASE)
-
-# キーワード規則（必要に応じて追加/調整）
-CATEGORY_RULES = [
-    (r"交通|電車|乗車|切符|運賃|タクシ|駐車|駐輪|高速|ETC",          ("旅費交通費",      "6611")),
-    (r"通信|モバイル|携帯|インターネット|Wi-?Fi|電話|回線|SIM",        ("通信費",          "6213")),
-    (r"交際|懇親|接待|会食|贈答|お土産|祝電",                         ("交際費",          "8121")),
-    (r"消耗品|文具|事務用品|インク|トナー|備品|テプラ|コピー紙",       ("消耗品費",        "6261")),
-    (r"会議|打合|打ち合わせ|ミーティング|会場費|レンタルスペース",     ("会議費",          "6222")),
-    (r"広告|宣伝|プロモ|チラシ|フライヤ|SNS広告|リスティング|出稿",     ("広告宣伝費",      "6111")),
-    (r"水道|電気|ガス|光熱|電力|検針票",                               ("水道光熱費",      "6221")),
-    (r"配送料|宅配|運送|クール便|郵送|ゆうパック|ネコポス|レターパック", ("荷造運賃",        "6241")),
-]
-
-def extract_amount(text: str) -> float | None:
-    amounts = []
-    for m in AMOUNT_PAT.finditer(text.replace(",", "").replace("，", "")):
-        try:
-            amounts.append(float(m.group(2)))
-        except Exception:
-            pass
-    return max(amounts) if amounts else None
-
-def extract_date(text: str) -> str | None:
-    m = DATE_PAT.search(text)
-    if not m:
-        return None
-    y, mo, d = m.group(1), m.group(2), m.group(3)
-    return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
-
-def extract_vendor(text: str) -> str | None:
-    m = VENDOR_PAT.search(text)
-    return m.group(0).strip() if m else None
-
-def classify_category(text: str) -> tuple[str, str, float]:
-    """
-    ルールで大分類と科目コードを決める。
-    return: (category, account_code, confidence)
-    """
-    text_norm = text.replace("　", " ")
-    for pat, (cat, code) in CATEGORY_RULES:
-        if re.search(pat, text_norm):
-            # マッチ数で簡易スコア
-            hits = len(re.findall(pat, text_norm))
-            conf = min(0.6 + 0.2 * hits, 0.95)
-            return cat, code, conf
-    return "雑費", "8899", 0.3
-
-
 
 # ---------- Local run ----------
 if __name__ == "__main__":
