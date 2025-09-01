@@ -278,7 +278,7 @@ def ensure_folder(path: str) -> dict:
         # 親に作成
         parent_path = acc_path.rsplit("/", 1)[0] or "/"
         if parent_path == "/":
-            create_url = f"{GRAPH_BASE}{base}/root/children}"
+            create_url = f"{GRAPH_BASE}{base}/root/children"
             # ↑typoを避けるため修正
             create_url = f"{GRAPH_BASE}{base}/root/children"
         else:
