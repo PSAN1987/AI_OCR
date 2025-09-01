@@ -8,8 +8,8 @@ A) 受信自動化
    - Google VisionでOCR
      * 画像: images:annotate（APIキー or サービスアカウントのどちらでも可）
      * PDF : files:asyncBatchAnnotate（サービスアカウント + GCS必須）
-   - OCRテキストからカテゴリ判定・氏名抽出・先生名抽出・保存日付決定
-   - 命名規則に従って OneDrive に分類保存（/同意書, /保険証, /治療報告書, /実績, /請求書）
+   - OCRテキストからカテゴリ判定・氏名/先生名/営業先/担当区/治療院/スタッフ名・日付を抽出
+   - 命名規則に従って OneDrive に分類保存
    - 共有リンクを作成して LINE で保存結果と保存先を返信
 
 B) 送信自動化（試験）
@@ -23,15 +23,15 @@ B) 送信自動化（試験）
   # Google / Vision
   GCP_SERVICE_ACCOUNT_JSON         # サービスアカウントのJSONそのもの or JSONファイルパス
   GOOGLE_VISION_API_KEY            # 任意（画像OCRで利用。未設定ならSA OAuthで実行）
-  GCS_BUCKET                       # PDF OCRで使用する一時バケット名（gs://<bucket> ではなく <bucket> 名）
+  GCS_BUCKET                       # PDF OCRで使用する一時バケット名（<bucket> 名）
 
   # Microsoft Graph / OneDrive (アプリケーション権限を推奨)
   MS_TENANT_ID
   MS_CLIENT_ID
   MS_CLIENT_SECRET
-  ONEDRIVE_DRIVE_ID                # 推奨: /drives/{drive-id}
+  ONEDRIVE_DRIVE_ID                # /drives/{drive-id} の id
   # もしくは
-  # ONEDRIVE_USER_ID               # /users/{user-or-upn}/drive（DRIVE_ID未設定時に使用）
+  # ONEDRIVE_USER_ID               # /users/{user-or-upn}/drive（DRIVE_ID未設定時）
 
   # 任意
   ONEDRIVE_BASE_FOLDER=/           # 保存ルート（既定 "/"）
@@ -42,7 +42,6 @@ B) 送信自動化（試験）
 
 import os
 import re
-import io
 import json
 import time
 import uuid
@@ -128,6 +127,7 @@ def _gcs_client():
     return storage.Client.from_service_account_info(info)
 
 def _now_date_str():
+    # 保存日付：YYYYMMDD
     return datetime.now().strftime("%Y%m%d")
 
 def _sanitize_filename(name: str) -> str:
@@ -228,7 +228,6 @@ def ocr_pdf_bytes_via_gcs(pdf_bytes: bytes, filename_hint: str = "input.pdf") ->
         content = out_blob.download_as_text(encoding="utf-8")
         try:
             data = json.loads(content)
-            # data['responses'] is an array of page responses
             for resp in data.get("responses", []):
                 full = resp.get("fullTextAnnotation", {}).get("text", "")
                 if full:
@@ -243,12 +242,15 @@ def ocr_pdf_bytes_via_gcs(pdf_bytes: bytes, filename_hint: str = "input.pdf") ->
     return "\n".join(t for t in texts if t).strip()
 
 # ---------- Classification / Extraction ----------
+
+# 分類対象に「患者リスト」を追加
 CAT_RULES = [
-    ("同意書",   r"同意|承諾|Consent|署名|サイン"),
-    ("保険証",   r"保険証|被保険者|保険者番号|記号|番号|有効期限"),
+    ("同意書",     r"同意|承諾|Consent|署名|サイン"),
+    ("保険証",     r"保険証|被保険者|保険者番号|記号|番号|有効期限"),
     ("治療報告書", r"治療報告書|報告書|診療報酬|所見|診断|経過"),
-    ("実績",     r"治療実績|実績|処置|施術|点数|算定"),
-    ("請求書",   r"請求書|請求|請求金額|振込先|お振込|INVOICE|請求合計"),
+    ("患者リスト", r"患者リスト|患者一覧|Patient List|患者台帳"),
+    ("実績",       r"治療実績|実績|処置|施術|点数|算定"),
+    ("請求書",     r"請求書|請求(?!先)|請求金額|振込先|お振込|INVOICE|請求合計"),
 ]
 
 DATE_PATTERNS = [
@@ -279,37 +281,91 @@ def extract_date(text: str):
 
 def extract_patient(text: str):
     for label in ["患者氏名", "患者名", "氏名", "お名前", "患者", "被保険者氏名"]:
-        m = re.search(label + r"\s*[:：]?\s*([^\n\r\t 　]{2,20})", text)
+        m = re.search(label + r"\s*[:：]?\s*([^\n\r\t 　]{2,30})", text)
         if m:
             return m.group(1).strip()
-    m = re.search(r"([^\s\n\r]{2,20})\s*様", text)
+    m = re.search(r"([^\s\n\r]{2,30})\s*様", text)
     return m.group(1).strip() if m else None
 
 def extract_doctor(text: str):
     for label in ["医師名", "担当医", "担当歯科医師", "歯科医師", "先生", "Dr", "Doctor"]:
-        m = re.search(label + r"\s*[:：]?\s*([^\n\r\t 　]{2,20})", text, flags=re.IGNORECASE)
+        m = re.search(label + r"\s*[:：]?\s*([^\n\r\t 　]{2,30})", text, flags=re.IGNORECASE)
         if m:
             return m.group(1).strip()
     return None
 
-def build_filename(category: str, patient, doctor, date_str, ext: str) -> str:
+# 追加抽出：営業先名・営業先担当区・治療院名・スタッフ名
+def extract_client(text: str) -> str | None:
+    m = re.search(r"(営業先|会社名|企業名|取引先)\s*[:：]?\s*([^\n\r\t 　]{2,50})", text)
+    return m.group(2).strip() if m else None
+
+def extract_client_dept(text: str) -> str | None:
+    m = re.search(r"(担当|担当区|部署|部|課)\s*[:：]?\s*([^\n\r\t 　]{2,50})", text)
+    return m.group(2).strip() if m else None
+
+def extract_clinic(text: str) -> str | None:
+    m = re.search(r"([^\s\n\r]{2,30}(治療院|クリニック|医院))", text)
+    return m.group(1).strip() if m else None
+
+def extract_staff(text: str) -> str | None:
+    m = re.search(r"(スタッフ|担当者|施術者|作成者)\s*[:：]?\s*([^\n\r\t 　]{2,30})", text)
+    return m.group(2).strip() if m else None
+
+def _ym_from_dt(dt: str) -> str:
+    # YYYYMM or YYYYMMDD → "YYYY年MM月"
+    y = dt[0:4]
+    m = dt[4:6]
+    return f"{y}年{m}月"
+
+def build_filename(category: str,
+                   patient: str,
+                   doctor: str,
+                   date_str: str,
+                   ext: str,
+                   text: str) -> str:
+    """
+    新しい命名ルールをカテゴリ別に適用（OCRから営業先/担当区/治療院/スタッフ名を抽出して利用）
+    ルール:
+      同意書:     同意書_患者氏名_先生名_保存日付
+      保険証:     保険証_患者氏名_保存日付
+      治療報告書: 患者名_営業先名_営業先担当区_YYYY年MM月_〇〇治療院_治療報告書_スタッフ名
+      患者リスト: 患者リスト_患者氏名_先生名_保存日付
+      請求書:     請求書_〇〇治療院_YYYY年MM月
+      実績:       実績_〇〇治療院_YYYY年MM月
+    """
     p = _sanitize_filename(patient or "不明")
     d = _sanitize_filename(doctor or "不明")
     dt = date_str or _now_date_str()
+    ym = _ym_from_dt(dt)
+
+    client = _sanitize_filename(extract_client(text) or "営業先不明")
+    client_dept = _sanitize_filename(extract_client_dept(text) or "担当区不明")
+    clinic = _sanitize_filename(extract_clinic(text) or "治療院不明")
+    staff = _sanitize_filename(extract_staff(text) or "スタッフ不明")
+
     if category == "同意書":
         return f"同意書_{p}_{d}_{dt}{ext}"
+
     if category == "保険証":
         return f"保険証_{p}_{dt}{ext}"
+
     if category == "治療報告書":
-        return f"治療報告書_{p}_{d}_{dt}{ext}"
-    if category == "実績":
-        return f"実績_{p}_{d}_{dt}{ext}"
+        return f"{p}_{client}_{client_dept}_{ym}_{clinic}_治療報告書_{staff}{ext}"
+
+    if category == "患者リスト":
+        return f"患者リスト_{p}_{d}_{dt}{ext}"
+
     if category == "請求書":
-        return f"請求書_{p}_{dt}{ext}"
+        return f"請求書_{clinic}_{ym}{ext}"
+
+    if category == "実績":
+        return f"実績_{clinic}_{ym}{ext}"
+
+    # その他カテゴリ
     return f"{category}_{p}_{dt}{ext}"
 
 def category_folder(category: str) -> str:
-    if category in ["同意書", "保険証", "治療報告書", "実績", "請求書"]:
+    if category in ["同意書", "保険証", "治療報告書", "患者リスト", "実績", "請求書"]:
         return f"{ONEDRIVE_BASE_FOLDER.rstrip('/')}/{category}"
     return f"{ONEDRIVE_BASE_FOLDER.rstrip('/')}/その他"
 
@@ -469,7 +525,7 @@ def handle_image(event: MessageEvent):
         date_str = extract_date(text) or _now_date_str()
         folder = category_folder(category)
         ensure_folder(folder)
-        filename = build_filename(category, patient, doctor, date_str, ext=".jpg")
+        filename = build_filename(category, patient, doctor, date_str, ext=".jpg", text=text)
 
         # 4) OneDriveへ保存
         if len(image_bytes) <= 4 * 1024 * 1024:
@@ -506,7 +562,7 @@ def handle_file(event: MessageEvent):
             date_str = extract_date(text) or _now_date_str()
             folder = category_folder(category)
             ensure_folder(folder)
-            filename = build_filename(category, patient, doctor, date_str, ext=".pdf")
+            filename = build_filename(category, patient, doctor, date_str, ext=".pdf", text=text)
 
             # 4) OneDriveへ保存（PDF）
             if len(pdf_bytes) <= 4 * 1024 * 1024:
@@ -559,3 +615,4 @@ def handle_text(event: MessageEvent):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "3000"))
     app.run(host="0.0.0.0", port=port)
+
