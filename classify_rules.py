@@ -3,6 +3,7 @@
 
 import re
 from datetime import datetime
+import unicodedata  # ← 追加
 
 # --- カテゴリごとのキーワードセット ---
 KEYWORDS = {
@@ -41,27 +42,96 @@ KEYWORDS = {
     ],
 }
 
+WEIGHTED_KEYWORDS = {
+    "同意書": [
+        (r"\b同意書\b", 5, True),
+        (r"\b同意\b", 2, False),
+        (r"署名|サイン|承諾|Consent", 2, False),
+    ],
+    "保険証": [
+        (r"\b(健康)?保険証\b", 5, True),
+        (r"保険者番号|記号\s*[:：]?\s*\S+|番号\s*[:：]?\s*\S+", 3, False),
+        (r"有効期限|交付日|発行者|保険者名", 2, False),
+    ],
+    "治療報告書": [
+        (r"\b治療報告書\b", 5, True),
+        (r"\b報告書\b", 2, False),
+        (r"所見|診断|施術計画|治療計画|症状|疼痛|ROM|機能評価", 2, False),
+    ],
+    "患者リスト": [
+        (r"患者(リスト|一覧)|Patient\s*List|患者台帳|フェイスシート", 5, True),
+        (r"利用者情報|ご利用者様|入居者情報", 3, False),
+        (r"要介護|認定日|電話番号|住所|生年月日", 2, False),
+    ],
+    "請求書": [
+        (r"\b請求書\b|\bINVOICE\b", 5, True),
+        (r"請求日|請求書番号|ご?請求金額|振込先|銀行|支店|口座番号|内訳|数量|単価|消費税|合計(金額|)", 2, False),
+    ],
+    "実績": [
+        (r"\b療養費支給申請書\b", 5, True),
+        (r"施術内訳|施術日|施術年月日|往療|通院|施術回数|回数|小計|合計|総計|総費用|施術者|施術管理者|申請者|公費負担|受給者番号|摘要", 2, False),
+    ],
+}
+
+# 誤爆抑制の減点語（任意）
+NEGATIVE_HINTS = {
+    "請求書": [r"見積書", r"納品書"],
+    "同意書": [r"説明書", r"注意書き"],
+}
+
+
 DATE_PATTERNS = [
     r"(20\d{2})[./年-](\d{1,2})[./月-](\d{1,2})日?",
     r"(20\d{2})-(\d{1,2})-(\d{1,2})",
     r"(20\d{2})/(\d{1,2})/(\d{1,2})",
 ]
 
+def normalize_text(t: str) -> str:
+    """OCRノイズを吸収する前処理"""
+    if not t:
+        return ""
+    t = unicodedata.normalize("NFKC", t)          # 全角半角統一
+    t = t.replace("ー", "-").replace("―", "-")    # ダッシュ揺れ
+    t = t.replace("・", " ")                      # 中黒→空白
+    t = re.sub(r"[ \t\u3000]+", " ", t)           # 連続空白を1つに
+    return t
+
 # --- 分類 ---
 def detect_category(text: str) -> str:
     """
-    複数キーワード一致数でスコアリングし、最もスコアが高いカテゴリを返す。
+    複数キーワード一致の重み付け＋アンカー語でスコアリング。
+    アンカー未ヒット or 僅差は「その他」へ。
     """
-    t = text.replace("　", " ")
-    scores = {k: 0 for k in KEYWORDS.keys()}
-    for cat, pats in KEYWORDS.items():
+    t = normalize_text(text)
+    scores = {k: 0 for k in WEIGHTED_KEYWORDS.keys()}
+    anchors_hit = {k: 0 for k in WEIGHTED_KEYWORDS.keys()}
+
+    for cat, pats in WEIGHTED_KEYWORDS.items():
+        for pat, w, is_anchor in pats:
+            hits = re.findall(pat, t, flags=re.IGNORECASE)
+            if hits:
+                scores[cat] += w * len(hits)
+                if is_anchor:
+                    anchors_hit[cat] += len(hits)
+
+    # 減点（ネガティブヒント）
+    for cat, pats in NEGATIVE_HINTS.items():
         for pat in pats:
-            matches = re.findall(pat, t, flags=re.IGNORECASE)
-            if matches:
-                # ヒット回数を加点
-                scores[cat] += len(matches)
+            if re.search(pat, t, flags=re.IGNORECASE):
+                scores[cat] -= 2
+
     best = max(scores, key=lambda k: scores[k])
-    return best if scores[best] > 0 else "その他"
+    # アンカー未ヒット or スコア非正 → その他
+    if anchors_hit[best] == 0 or scores[best] <= 0:
+        return "その他"
+
+    # 僅差（不確実）なら その他
+    top2 = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:2]
+    if len(top2) == 2 and (top2[0][1] - top2[1][1]) < 3:
+        return "その他"
+
+    return best
+
 
 # --- 日付抽出 ---
 def extract_date(text: str):
