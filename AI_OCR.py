@@ -229,7 +229,7 @@ def ocr_pdf_bytes_via_gcs(pdf_bytes: bytes, filename_hint: str = "input.pdf") ->
 
 # ---------- 分類先フォルダ ----------
 def category_folder(category: str) -> str:
-    if category in ["同意書", "保険証", "治療報告書", "患者リスト", "実績", "請求書"]:
+    if category in ["03_同意書", "04_保険証", "06_治療報告書", "01_患者リスト", "02_実績", "05_請求書"]:
         return f"{ONEDRIVE_BASE_FOLDER.rstrip('/')}/{category}"
     return f"{ONEDRIVE_BASE_FOLDER.rstrip('/')}/その他"
 
