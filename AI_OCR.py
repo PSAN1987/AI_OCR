@@ -228,10 +228,21 @@ def ocr_pdf_bytes_via_gcs(pdf_bytes: bytes, filename_hint: str = "input.pdf") ->
     return "\n".join(t for t in texts if t).strip()
 
 # ---------- 分類先フォルダ ----------
+CATEGORY_TO_FOLDER = {
+    "患者リスト": "01_患者リスト",
+    "実績": "02_実績",
+    "同意書": "03_同意書",
+    "保険証": "04_保険証",
+    "請求書": "05_請求書",
+    "治療報告書": "06_治療報告書",
+}
+
 def category_folder(category: str) -> str:
-    if category in ["03_同意書", "04_保険証", "06_治療報告書", "01_患者リスト", "02_実績", "05_請求書"]:
-        return f"{ONEDRIVE_BASE_FOLDER.rstrip('/')}/{category}"
+    mapped = CATEGORY_TO_FOLDER.get(category)
+    if mapped:
+        return f"{ONEDRIVE_BASE_FOLDER.rstrip('/')}/{mapped}"
     return f"{ONEDRIVE_BASE_FOLDER.rstrip('/')}/その他"
+
 
 # ---------- Microsoft Graph (OneDrive) ----------
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
