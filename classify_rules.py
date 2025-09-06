@@ -1,5 +1,5 @@
 ﻿# classify_rules.py
-# OCRテキストから分類・項目抽出・命名を行うロジック
+# OCRテキストから分類・項目抽出・命名を行うロジック（既存インターフェース互換）
 
 import re
 from datetime import datetime
@@ -7,27 +7,33 @@ import unicodedata
 
 # ---------- 正規化 ----------
 def normalize_text(t: str) -> str:
+    """OCRの揺れを吸収。ラベル崩れ/住所表記のゆらぎも補正。"""
     if not t:
         return ""
     t = unicodedata.normalize("NFKC", t)
     t = t.replace("　", " ")
-    t = re.sub(r"[ \t]+", " ", t)  # 連続空白を1つに
+    t = re.sub(r"[ \t]+", " ", t)  # 連続空白 → 1個
     # ラベル/住所の崩れ補正
     t = re.sub(r"住\s*所", "住所", t)  # 「住 所」→「住所」
     t = re.sub(r"(患者|被保険者|保険医|医師)\s*氏\s*(?:所\s*)?名", r"\1氏名", t)  # 「患者 氏 所名」→「患者氏名」
-    t = re.sub(r"氏\s*(?:所\s*)?名", "氏名", t)
+    t = re.sub(r"氏\s*(?:所\s*)?名", "氏名", t)  # 単独の「氏 名/氏 所名」も救済
     return t
 
 # ---------- フルネーム判定 ----------
 NAME_TOKEN = r"[一-龥々〆ヵヶァ-ンーA-Za-z]{1,15}"
-# 区切りに \s を許容（改行もOK）
+# 区切りに \s（改行含む）/中黒を許容
 FULLNAME_SEP    = rf"({NAME_TOKEN})[\s･・]+({NAME_TOKEN})"   # 例: 佐藤 太郎 / 佐藤･太郎 / 佐藤\n太郎
 FULLNAME_CONTIG = rf"({NAME_TOKEN})({NAME_TOKEN})"           # 例: 佐藤太郎
 
 def _join_fullname(g1: str, g2: str) -> str:
     return f"{g1}{g2}"
 
-# ---------- カテゴリキーワード ----------
+# 住所っぽい候補の排除（氏名誤認防止：港区新茶屋 等）
+ADDRESS_TOKENS = r"(都|道|府|県|市|区|町|村|丁目|番地|番|号|郡|荘|マンション|アパート|ビル)"
+def _looks_addressy(s: str) -> bool:
+    return bool(re.search(ADDRESS_TOKENS, s))
+
+# ---------- カテゴリキーワード（単純スコア） ----------
 KEYWORDS = {
     "同意書": [
         r"同意書", r"同意", r"承諾", r"署名", r"サイン", r"Consent",
@@ -72,6 +78,7 @@ DATE_PATTERNS = [
 ]
 
 def extract_date(text: str):
+    """YYYYMMDD（文字列）を返す。見つからなければ None。令和対応。"""
     t = normalize_text(text)
     for p in DATE_PATTERNS:
         m = re.search(p, t)
@@ -88,8 +95,9 @@ def extract_date(text: str):
 def detect_category(text: str) -> str:
     """
     複数キーワード一致数でスコアリングし、最もスコアが高いカテゴリを返す。
+    ヒットが無ければ「その他」。
     """
-    t = normalize_text(text)  # ★ 正規化してから判定
+    t = normalize_text(text)  # 正規化後に判定
     scores = {k: 0 for k in KEYWORDS.keys()}
     for cat, pats in KEYWORDS.items():
         for pat in pats:
@@ -101,51 +109,91 @@ def detect_category(text: str) -> str:
 
 # ---------- 項目抽出 ----------
 def _fullname_on_same_line_after(label: str, t: str):
+    """ラベルと同じ行の後方にあるフルネームを拾う（住所→氏名の並び救済）。"""
     m = re.search(label + r"\s*[:：]?[^\n]*", t)  # ラベルから改行まで
     if not m:
         return None
     line = m.group(0)
-    # 行の後ろ側のフルネームを優先（住所の後ろに氏名がある想定）
     cands = list(re.finditer(FULLNAME_SEP, line)) or list(re.finditer(FULLNAME_CONTIG, line))
-    if cands:
-        g = cands[-1]
-        return _join_fullname(g.group(1), g.group(2))
+    for g in reversed(cands):  # 行末側を優先
+        cand = _join_fullname(g.group(1), g.group(2))
+        if not _looks_addressy(cand):
+            return cand
+    return None
+
+def _fullname_on_next_line_after(label: str, t: str):
+    """ラベルの次の行頭にフルネームがあるケースを拾う。"""
+    m = re.search(label + r"\s*[:：]?.*?\n", t)
+    if not m:
+        return None
+    start = m.end()
+    next_line = t[start:start+120]  # 次行の先頭のみ見る（過剰一致防止）
+    g = re.search(FULLNAME_SEP, next_line) or re.search(FULLNAME_CONTIG, next_line)
+    if g:
+        cand = _join_fullname(g.group(1), g.group(2))
+        if not _looks_addressy(cand):
+            return cand
     return None
 
 def extract_patient(text: str):
+    """
+    フルネーム必須。ラベル崩れ・住所混入・改行区切りに頑健。
+    見つからなければ None（命名側で「不明」へ）。
+    """
     t = normalize_text(text)
-    # 1) 明示ラベル直後
+
+    # 1) 明示ラベル直後（最優先）
     for lb in [r"患者氏名", r"患者名", r"被保険者氏名", r"被保険者名"]:
         m = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_SEP, t)
-        if m: return _join_fullname(m.group(1), m.group(2))
+        if m:
+            cand = _join_fullname(m.group(1), m.group(2))
+            if not _looks_addressy(cand): return cand
         m2 = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_CONTIG, t)
-        if m2: return _join_fullname(m2.group(1), m2.group(2))
-        # 1') 同じ行内の後方フォールバック（住所→氏名の並びを救済）
+        if m2:
+            cand = _join_fullname(m2.group(1), m2.group(2))
+            if not _looks_addressy(cand): return cand
+        # 行内後方フォールバック（住所→氏名の並び）
         fn = _fullname_on_same_line_after(lb, t)
         if fn: return fn
+        # 次の行フォールバック
+        fn2 = _fullname_on_next_line_after(lb, t)
+        if fn2: return fn2
 
     # 2) 「氏名」だが保険医/医師等の氏名は除外
     excl = r"(?<!保険医)(?<!医師)(?<!施術者)(?<!担当者)(?<!保険者)(?<!被保険者)"
     m = re.search(excl + r"氏名\s*[:：]?\s*" + FULLNAME_SEP, t)
-    if m: return _join_fullname(m.group(1), m.group(2))
+    if m:
+        cand = _join_fullname(m.group(1), m.group(2))
+        if not _looks_addressy(cand): return cand
     m = re.search(excl + r"氏名\s*[:：]?\s*" + FULLNAME_CONTIG, t)
-    if m: return _join_fullname(m.group(1), m.group(2))
+    if m:
+        cand = _join_fullname(m.group(1), m.group(2))
+        if not _looks_addressy(cand): return cand
 
-    # 3) 「患者 …（最大30文字）… フルネーム」救済（同一行）
+    # 3) 「患者 …（最大30文字）… フルネーム」（同一行）
     m = re.search(r"患者[^\n]{0,30}" + FULLNAME_SEP, t)
-    if m: return _join_fullname(m.group(1), m.group(2))
+    if m:
+        cand = _join_fullname(m.group(1), m.group(2))
+        if not _looks_addressy(cand): return cand
     m = re.search(r"患者[^\n]{0,30}" + FULLNAME_CONTIG, t)
-    if m: return _join_fullname(m.group(1), m.group(2))
+    if m:
+        cand = _join_fullname(m.group(1), m.group(2))
+        if not _looks_addressy(cand): return cand
 
     # 4) 「…様」（フルネームのみ）
     m = re.search(FULLNAME_SEP + r"\s*様\b", t)
-    if m: return _join_fullname(m.group(1), m.group(2))
+    if m:
+        cand = _join_fullname(m.group(1), m.group(2))
+        if not _looks_addressy(cand): return cand
     m = re.search(FULLNAME_CONTIG + r"\s*様\b", t)
-    if m: return _join_fullname(m.group(1), m.group(2))
+    if m:
+        cand = _join_fullname(m.group(1), m.group(2))
+        if not _looks_addressy(cand): return cand
 
     return None  # フルネーム未満は採用しない
 
 def extract_doctor(text: str):
+    """医師/保険医のフルネームを抽出。改行区切りにも対応。"""
     t = normalize_text(text)
     for lb in [r"保険医氏名", r"医師氏名", r"医師名", r"担当医", r"先生", r"Dr", r"Doctor"]:
         m_sep = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_SEP, t, flags=re.IGNORECASE)
@@ -184,7 +232,7 @@ def _ym_from_dt(dt: str) -> str:
     return f"{dt[0:4]}年{dt[4:6]}月"
 
 def _compact(s: str) -> str:
-    # 連続した空白/アンダースコアを縮め、全角空白も吸収
+    """余分な空白/アンダースコアを整理。"""
     s = re.sub(r"[ \u3000]+", " ", s).strip()
     s = re.sub(r"_+", "_", s)
     s = re.sub(r"[ _]{2,}", " ", s)
@@ -193,7 +241,7 @@ def _compact(s: str) -> str:
 def _tokens(text: str, patient: str, doctor: str, date_str: str) -> dict:
     dt = date_str or datetime.now().strftime("%Y%m%d")
     ym = _ym_from_dt(dt)
-    tokens = {
+    return {
         "patient": _sanitize_filename(patient or "不明"),
         "doctor": _sanitize_filename(doctor or "不明"),
         "date": dt,
@@ -205,9 +253,8 @@ def _tokens(text: str, patient: str, doctor: str, date_str: str) -> dict:
         "staff": _sanitize_filename(extract_staff(text) or "スタッフ不明"),
         "invoice_clinic": _sanitize_filename(extract_invoice_clinic(text) or (extract_clinic(text) or "治療院不明")),
     }
-    return tokens
 
-# カテゴリ別テンプレート（あとから差し替え可能）
+# カテゴリ別テンプレート（差し替え容易）
 NAMING_TEMPLATES = {
     "同意書":      "同意書_{patient}_{doctor}_{date}",
     "保険証":      "保険証_{patient}_{date}",
@@ -215,7 +262,6 @@ NAMING_TEMPLATES = {
     "患者リスト":  "患者リスト_{patient}_{doctor}_{date}",
     "請求書":      "請求書_{invoice_clinic}_{ym}",
     "実績":        "実績_{clinic}_{ym}",
-    # 将来カテゴリを足す場合はここに追記
 }
 
 def build_filename(category: str,
@@ -224,11 +270,12 @@ def build_filename(category: str,
                    date_str: str,
                    ext: str,
                    text: str) -> str:
+    """テンプレート駆動の命名（既存の引数/戻り値は不変）。"""
     toks = _tokens(text, patient, doctor, date_str)
     tmpl = NAMING_TEMPLATES.get(category, "{cat}_{patient}_{date}")
     name = tmpl.format_map({**toks, "cat": category})
     name = _compact(name)
-    # 長すぎるとOneDriveの扱いが悪くなるので丸め（拡張子は維持）
+    # OneDrive で扱いやすい長さに丸め（拡張子は維持）
     MAX_BASENAME = 80
     if len(name) > MAX_BASENAME:
         name = name[:MAX_BASENAME].rstrip("_ ").rstrip()
