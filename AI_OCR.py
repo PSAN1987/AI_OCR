@@ -413,13 +413,50 @@ def callback():
 # ---------- Handlers ----------
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image(event: MessageEvent):
+    # ---- 安全な初期値（例外時にも参照できる）----
+    kind = "image"
+    date_str = _now_date_str()
+    category = "N/A"
+    patient = ""
+    doctor = ""
+    folder = ""
+    filename = ""
+    link = ""
+    text = ""
+    # ----------------------------------------------
     try:
-        # ...（既存）画像→OCR→分類・抽出→命名→OneDrive保存...
-        # ▼ 成功ログを追記
+        # 1) 画像取得
+        content = line_bot_api.get_message_content(event.message.id)
+        image_bytes = b"".join(chunk for chunk in content.iter_content())
+
+        # 2) OCR
+        text = ocr_image_bytes(image_bytes)
+
+        # 3) 分類・抽出
+        category = detect_category(text)
+        patient = extract_patient(text)
+        doctor = extract_doctor(text)
+        extracted = extract_date(text)
+        if extracted:
+            date_str = extracted
+
+        # 4) 保存先・命名
+        folder = category_folder(category)
+        ensure_folder(folder)
+        filename = build_filename(category, patient, doctor, date_str, ext=".jpg", text=text)
+
+        # 5) OneDriveへ保存
+        if len(image_bytes) <= 4 * 1024 * 1024:
+            item = upload_small(folder, filename, image_bytes, "image/jpeg")
+        else:
+            item = upload_large(folder, filename, image_bytes, "image/jpeg")
+        link = create_share_link(item["id"])
+
+        # 6) ★成功ログをここで追記（OCR結果が入る）
         gsheet_append_rows([[
             datetime.now().isoformat(timespec="seconds"),  # 保存日時ISO
             date_str,                                      # 保存日付YYYYMMDD
-            "image",                                       # 種別
+            kind,                                          # 種別
             category,                                      # 分類
             patient or "",                                 # 患者
             doctor or "",                                  # 先生
@@ -434,55 +471,7 @@ def handle_image(event: MessageEvent):
             ""                                             # エラーメッセージ
         ]])
 
-        # ...（既存）返信
-    except Exception as e:
-        # ▼ 失敗ログ（可能な範囲で）
-        try:
-            gsheet_append_rows([[
-                datetime.now().isoformat(timespec="seconds"),
-                _now_date_str(),
-                "image",
-                "N/A",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "0",
-                "",
-                "error",
-                getattr(event.message, "id", ""),
-                str(e)[:200]
-            ]])
-        except Exception:
-            pass
-        # ...（既存）エラー返信
-
-        # 1) 画像バイト取得
-        content = line_bot_api.get_message_content(event.message.id)
-        image_bytes = b"".join(chunk for chunk in content.iter_content())
-
-        # 2) OCR
-        text = ocr_image_bytes(image_bytes)
-
-        # 3) 分類＆命名（classify_rules を使用）
-        category = detect_category(text)
-        patient = extract_patient(text)
-        doctor = extract_doctor(text)
-        date_str = extract_date(text) or _now_date_str()
-        folder = category_folder(category)
-        ensure_folder(folder)
-        filename = build_filename(category, patient, doctor, date_str, ext=".jpg", text=text)
-
-        # 4) OneDriveへ保存
-        if len(image_bytes) <= 4 * 1024 * 1024:
-            item = upload_small(folder, filename, image_bytes, "image/jpeg")
-        else:
-            item = upload_large(folder, filename, image_bytes, "image/jpeg")
-        link = create_share_link(item["id"])
-
-        # 5) 返信
+        # 7) 返信
         msg = (f"分類: {category}\n"
                f"患者: {patient or '不明'} / 先生: {doctor or '不明'} / 日付: {date_str}\n"
                f"保存先: {folder}/{filename}\n"
@@ -490,84 +479,70 @@ def handle_image(event: MessageEvent):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
 
     except Exception as e:
+        # ★失敗時ログ（初期値で安全に記録）
+        try:
+            gsheet_append_rows([[
+                datetime.now().isoformat(timespec="seconds"),
+                date_str, kind, category, patient, doctor, "",
+                folder, filename, link, "0", "", "error",
+                getattr(event.message, "id", ""), str(e)[:300]
+            ]])
+        except Exception:
+            pass
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"処理失敗（画像）: {e}"))
 
 @handler.add(MessageEvent, message=FileMessage)
 def handle_file(event: MessageEvent):
+    # ---- 安全な初期値 ----
+    kind = "pdf"
+    date_str = _now_date_str()
+    category = "N/A"
+    patient = ""
+    doctor = ""
+    folder = ""
+    filename = ""
+    link = ""
+    text = ""
+    # ----------------------
     try:
         if (event.message.file_name or "").lower().endswith(".pdf"):
-            # ...（既存）PDF→OCR→分類・抽出→命名→OneDrive保存...
-            # ▼ 成功ログを追記
-            gsheet_append_rows([[
-                datetime.now().isoformat(timespec="seconds"),
-                date_str,
-                "pdf",
-                category,
-                patient or "",
-                doctor or "",
-                date_str,
-                folder,
-                filename,
-                link,
-                str(len(text or "")),
-                (text or "").replace("\n", " ")[:100],
-                "success",
-                event.message.id,
-                ""
-            ]])
-
-            # ...（既存）返信
-        else:
-            # PDF以外の案内（ログは任意）
-            pass
-    except Exception as e:
-        try:
-            gsheet_append_rows([[
-                datetime.now().isoformat(timespec="seconds"),
-                _now_date_str(),
-                "pdf",
-                "N/A",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "0",
-                "",
-                "error",
-                getattr(event.message, "id", ""),
-                str(e)[:200]
-            ]])
-        except Exception:
-            pass
-        # ...（既存）エラー返信
-
-        if (event.message.file_name or "").lower().endswith(".pdf"):
-            # 1) PDFバイト取得
+            # 1) PDF取得
             content = line_bot_api.get_message_content(event.message.id)
             pdf_bytes = b"".join(chunk for chunk in content.iter_content())
 
             # 2) OCR（Vision async + GCS）
             text = ocr_pdf_bytes_via_gcs(pdf_bytes, filename_hint=event.message.file_name or "input.pdf")
 
-            # 3) 分類＆命名（classify_rules を使用）
+            # 3) 分類・抽出
             category = detect_category(text)
             patient = extract_patient(text)
             doctor = extract_doctor(text)
-            date_str = extract_date(text) or _now_date_str()
+            extracted = extract_date(text)
+            if extracted:
+                date_str = extracted
+
+            # 4) 保存先・命名
             folder = category_folder(category)
             ensure_folder(folder)
             filename = build_filename(category, patient, doctor, date_str, ext=".pdf", text=text)
 
-            # 4) OneDriveへ保存（PDF）
+            # 5) OneDriveへ保存
             if len(pdf_bytes) <= 4 * 1024 * 1024:
                 item = upload_small(folder, filename, pdf_bytes, "application/pdf")
             else:
                 item = upload_large(folder, filename, pdf_bytes, "application/pdf")
             link = create_share_link(item["id"])
 
-            # 5) 返信
+            # 6) ★成功ログ
+            gsheet_append_rows([[
+                datetime.now().isoformat(timespec="seconds"),
+                date_str, kind, category, patient or "", doctor or "", date_str,
+                folder, filename, link, str(len(text or "")),
+                (text or "").replace("\n", " ")[:300],
+                "success", event.message.id, ""
+            ]])
+
+            # 7) 返信
             msg = (f"分類: {category}\n"
                    f"患者: {patient or '不明'} / 先生: {doctor or '不明'} / 日付: {date_str}\n"
                    f"保存先: {folder}/{filename}\n"
@@ -575,8 +550,19 @@ def handle_file(event: MessageEvent):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         else:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text="PDF以外のファイルは未対応です。画像はそのまま送ってください。"))
+
     except Exception as e:
+        try:
+            gsheet_append_rows([[
+                datetime.now().isoformat(timespec="seconds"),
+                date_str, kind, category, patient, doctor, "",
+                folder, filename, link, "0", "", "error",
+                getattr(event.message, "id", ""), str(e)[:200]
+            ]])
+        except Exception:
+            pass
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"処理失敗（PDF）: {e}"))
+
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event: MessageEvent):
