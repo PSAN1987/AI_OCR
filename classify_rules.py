@@ -111,11 +111,48 @@ def extract_invoice_clinic(text: str):
     return None
 
 # --- ファイル名生成 ---
+# 追加: 先頭付近のimportsのままでOK（re, datetimeは既にあります）
+
 def _sanitize_filename(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]+', "_", name).strip() or "不明"
 
 def _ym_from_dt(dt: str) -> str:
     return f"{dt[0:4]}年{dt[4:6]}月"
+
+def _compact(s: str) -> str:
+    # 連続した空白/アンダースコアを縮め、全角空白も吸収
+    s = re.sub(r"[ \u3000]+", " ", s).strip()
+    s = re.sub(r"_+", "_", s)
+    s = re.sub(r"[ _]{2,}", " ", s)
+    return s
+
+def _tokens(text: str, patient: str, doctor: str, date_str: str) -> dict:
+    dt = date_str or datetime.now().strftime("%Y%m%d")
+    ym = _ym_from_dt(dt)
+    tokens = {
+        "patient": _sanitize_filename(patient or "不明"),
+        "doctor": _sanitize_filename(doctor or "不明"),
+        "date": dt,
+        "ym": ym,
+        # 既存抽出器を再利用
+        "client": _sanitize_filename(extract_client(text) or "営業先不明"),
+        "client_dept": _sanitize_filename(extract_client_dept(text) or "担当区不明"),
+        "clinic": _sanitize_filename(extract_clinic(text) or "治療院不明"),
+        "staff": _sanitize_filename(extract_staff(text) or "スタッフ不明"),
+        "invoice_clinic": _sanitize_filename(extract_invoice_clinic(text) or (extract_clinic(text) or "治療院不明")),
+    }
+    return tokens
+
+# カテゴリ別テンプレート（あとから差し替え可能）
+NAMING_TEMPLATES = {
+    "同意書":      "同意書_{patient}_{doctor}_{date}",
+    "保険証":      "保険証_{patient}_{date}",
+    "治療報告書":  "{patient}_{client}_{client_dept}_{ym}_{clinic}_治療報告書_{staff}",
+    "患者リスト":  "患者リスト_{patient}_{doctor}_{date}",
+    "請求書":      "請求書_{invoice_clinic}_{ym}",
+    "実績":        "実績_{clinic}_{ym}",
+    # 将来カテゴリを足す場合はここに追記
+}
 
 def build_filename(category: str,
                    patient: str,
@@ -123,27 +160,13 @@ def build_filename(category: str,
                    date_str: str,
                    ext: str,
                    text: str) -> str:
-    p = _sanitize_filename(patient or "不明")
-    d = _sanitize_filename(doctor or "不明")
-    dt = date_str or datetime.now().strftime("%Y%m%d")
-    ym = _ym_from_dt(dt)
-
-    client = _sanitize_filename(extract_client(text) or "営業先不明")
-    client_dept = _sanitize_filename(extract_client_dept(text) or "担当区不明")
-    clinic = _sanitize_filename(extract_clinic(text) or "治療院不明")
-    staff = _sanitize_filename(extract_staff(text) or "スタッフ不明")
-
-    if category == "同意書":
-        return f"同意書_{p}_{d}_{dt}{ext}"
-    if category == "保険証":
-        return f"保険証_{p}_{dt}{ext}"
-    if category == "治療報告書":
-        return f"{p}_{client}_{client_dept}_{ym}_{clinic}_治療報告書_{staff}{ext}"
-    if category == "患者リスト":
-        return f"患者リスト_{p}_{d}_{dt}{ext}"
-    if category == "請求書":
-        invoice_clinic = _sanitize_filename(extract_invoice_clinic(text) or clinic)
-        return f"請求書_{invoice_clinic}_{ym}{ext}"
-    if category == "実績":
-        return f"実績_{clinic}_{ym}{ext}"
-    return f"{category}_{p}_{dt}{ext}"
+    toks = _tokens(text, patient, doctor, date_str)
+    # テンプレートがなければ従来に近い汎用形式へ
+    tmpl = NAMING_TEMPLATES.get(category, "{cat}_{patient}_{date}")
+    name = tmpl.format_map({**toks, "cat": category})
+    name = _compact(name)
+    # 長すぎるとOneDriveの扱いが悪くなるので丸め（拡張子は維持）
+    MAX_BASENAME = 80
+    if len(name) > MAX_BASENAME:
+        name = name[:MAX_BASENAME].rstrip("_ ").rstrip()
+    return f"{name}{ext}"

@@ -330,6 +330,25 @@ def ensure_folder(path: str) -> dict:
     fr.raise_for_status()
     return fr.json()
 
+# AI_OCR.py に追加（ensure_folder の近く。Graph の GET で存在確認）
+def _file_exists(path_folder: str, filename: str) -> bool:
+    base = _drive_base()
+    url = f"{GRAPH_BASE}{base}/root:{quote(f'{path_folder.rstrip('/')}/{filename}', safe='/')}"
+    r = requests.get(url, headers=graph_headers(), timeout=15)
+    return r.status_code == 200
+
+def uniquify_filename(path_folder: str, filename: str) -> str:
+    if not _file_exists(path_folder, filename):
+        return filename
+    base, dot, ext = filename.rpartition(".")
+    base = base if dot else filename  # 拡張子なしにも対応
+    ext = f".{ext}" if dot else ""
+    for i in range(2, 50):
+        cand = f"{base}_v{i}{ext}"
+        if not _file_exists(path_folder, cand):
+            return cand
+    return f"{base}_{uuid.uuid4().hex[:6]}{ext}"
+
 def upload_small(path_folder: str, filename: str, data: bytes, content_type: str) -> dict:
     """単発アップロード（~4MB）。戻り値は driveItem。"""
     headers = graph_headers()
