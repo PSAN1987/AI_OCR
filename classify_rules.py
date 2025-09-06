@@ -26,7 +26,7 @@ def normalize_text(t: str) -> str:
     return t
 
 # ---------- フルネーム判定 ----------
-NAME_TOKEN = r"[一-龥々〆ヵヶァ-ンーA-Za-z]{1,15}"
+NAME_TOKEN = r"[ぁ-んァ-ンー一-龥々〆ヵヶA-Za-z]{1,15}"
 # 区切りに \s（改行含む）/中黒を許容
 FULLNAME_SEP    = rf"({NAME_TOKEN})[\s･・]+({NAME_TOKEN})"   # 例: 佐藤 太郎 / 佐藤･太郎 / 佐藤\n太郎
 FULLNAME_CONTIG = rf"({NAME_TOKEN})({NAME_TOKEN})"           # 例: 佐藤太郎
@@ -174,58 +174,68 @@ def _fullname_on_next_line_after(label: str, t: str):
 
 def extract_patient(text: str):
     """
-    フルネーム必須。ラベル崩れ・住所混入・改行区切りに頑健。
+    フルネーム必須。ラベル崩れ・住所混入・改行区切り・「様の」等に頑健。
     見つからなければ None（命名側で「不明」へ）。
     """
     t = normalize_text(text)
+
+    # 「…様の/様は/様です/さま」も許容（保険証など）
+    TAIL_SAMA = r"(?:\s*様(?:の|は|です|で|に)?|\s*さま)"
+
+    def _accept(g1: str, g2: str):
+        cand = _join_fullname(g1, g2)  # ※ 末尾「生年月日」等の除去は _join_fullname で実施済み
+        return cand if not _looks_addressy(cand) else None
 
     # 1) 明示ラベル直後（最優先）
     for lb in [r"患者氏名", r"患者名", r"被保険者氏名", r"被保険者名"]:
         m = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_SEP, t)
         if m:
-            cand = _join_fullname(m.group(1), m.group(2))
-            if not _looks_addressy(cand): return cand
+            cand = _accept(m.group(1), m.group(2))
+            if cand: return cand
         m2 = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_CONTIG, t)
         if m2:
-            cand = _join_fullname(m2.group(1), m2.group(2))
-            if not _looks_addressy(cand): return cand
+            cand = _accept(m2.group(1), m2.group(2))
+            if cand: return cand
         # 行内後方フォールバック（住所→氏名の並び）
         fn = _fullname_on_same_line_after(lb, t)
-        if fn: return fn
+        if fn and not _looks_addressy(fn): return fn
         # 次の行フォールバック
         fn2 = _fullname_on_next_line_after(lb, t)
-        if fn2: return fn2
+        if fn2 and not _looks_addressy(fn2): return fn2
 
-    # 2) 「氏名」だが保険医/医師等の氏名は除外
+    # 2) 「氏名」だが保険医/医師等の氏名は除外（一般ラベル）
     excl = r"(?<!保険医)(?<!医師)(?<!施術者)(?<!担当者)(?<!保険者)(?<!被保険者)"
     m = re.search(excl + r"氏名\s*[:：]?\s*" + FULLNAME_SEP, t)
     if m:
-        cand = _join_fullname(m.group(1), m.group(2))
-        if not _looks_addressy(cand): return cand
+        cand = _accept(m.group(1), m.group(2))
+        if cand: return cand
     m = re.search(excl + r"氏名\s*[:：]?\s*" + FULLNAME_CONTIG, t)
     if m:
-        cand = _join_fullname(m.group(1), m.group(2))
-        if not _looks_addressy(cand): return cand
+        cand = _accept(m.group(1), m.group(2))
+        if cand: return cand
+    # 2') 「氏名」行の後方フォールバック（同一行の末尾側から拾う）
+    fn3 = _fullname_on_same_line_after(excl + r"氏名", t)
+    if fn3 and not _looks_addressy(fn3): return fn3
 
     # 3) 「患者 …（最大30文字）… フルネーム」（同一行）
     m = re.search(r"患者[^\n]{0,30}" + FULLNAME_SEP, t)
     if m:
-        cand = _join_fullname(m.group(1), m.group(2))
-        if not _looks_addressy(cand): return cand
+        cand = _accept(m.group(1), m.group(2))
+        if cand: return cand
     m = re.search(r"患者[^\n]{0,30}" + FULLNAME_CONTIG, t)
     if m:
-        cand = _join_fullname(m.group(1), m.group(2))
-        if not _looks_addressy(cand): return cand
+        cand = _accept(m.group(1), m.group(2))
+        if cand: return cand
 
-    # 4) 「…様」（フルネームのみ）
-    m = re.search(FULLNAME_SEP + r"\s*様\b", t)
+    # 4) 「…様」（助詞つき/ひらがな さま もOK）
+    m = re.search(FULLNAME_SEP + TAIL_SAMA, t)
     if m:
-        cand = _join_fullname(m.group(1), m.group(2))
-        if not _looks_addressy(cand): return cand
-    m = re.search(FULLNAME_CONTIG + r"\s*様\b", t)
+        cand = _accept(m.group(1), m.group(2))
+        if cand: return cand
+    m = re.search(FULLNAME_CONTIG + TAIL_SAMA, t)
     if m:
-        cand = _join_fullname(m.group(1), m.group(2))
-        if not _looks_addressy(cand): return cand
+        cand = _accept(m.group(1), m.group(2))
+        if cand: return cand
 
     return None  # フルネーム未満は採用しない
 
