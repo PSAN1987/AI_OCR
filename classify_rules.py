@@ -5,6 +5,27 @@ import re
 from datetime import datetime
 import unicodedata
 
+# ▼ 既存の import 群の下あたりに追加
+LABEL_STOPS = [
+    r"生\s*年\s*月\s*日", r"生年月日", r"性別", r"住所", r"有効期限",
+    r"保険者番号", r"被保険者番号", r"記号", r"番号",
+    r"電話", r"TEL", r"FAX",
+    r"保険医氏名", r"医師氏名", r"医師名", r"担当医",
+    r"病院名", r"クリニック", r"医院", r"病院", r"施術者", r"担当者",
+]
+LABEL_STOP_RE = re.compile("|".join(LABEL_STOPS))
+
+def _strip_after_labels(s: str) -> str:
+    """「生年月日」「住所」などのラベル語が出たら、それ以降をばっさり捨てる。"""
+    s = re.split(LABEL_STOP_RE, s)[0]
+    return s.strip(" 　:：.-_/|,、。")
+
+def _clean_name_token(tok: str) -> str:
+    """氏名トークン末尾の敬称やラベル片を除去。"""
+    tok = re.sub(r"(様|さま|殿|さん)$", "", tok)
+    tok = re.sub(r"(生年月日|性別|住所|有効期限|記号|番号)$", "", tok)
+    return tok.strip()
+
 # ---------- 正規化 ----------
 def normalize_text(t: str) -> str:
     if not t:
@@ -56,17 +77,35 @@ NAME_TOKEN = r"[ぁ-んァ-ンー一-龥々〆ヵヶA-Za-z]{1,15}"
 FULLNAME_SEP    = rf"({NAME_TOKEN})[\s･・]+({NAME_TOKEN})"   # 例: 佐藤 太郎 / 佐藤･太郎 / 佐藤\n太郎
 FULLNAME_CONTIG = rf"({NAME_TOKEN})({NAME_TOKEN})"           # 例: 佐藤太郎
 
+# ▼ 既存の _join_fullname を置き換え
 def _join_fullname(g1: str, g2: str) -> str:
-    # フルネーム結合
+    g1 = _clean_name_token(g1)
+    g2 = _clean_name_token(g2)
     s = f"{g1}{g2}"
-    # 末尾にくっついた「生年月日」などを素朴に除去（空白/OCRゆらぎ対応）
-    s = re.sub(r"(生\s*年\s*月\s*日|生\s*年\s*月|生年月日|生年月|誕生日|DOB)\s*$", "", s)
-    # 念のため末尾空白を除去
+    # 末尾にくっついたラベル語は強制削除（後続に数字が続いても落とす）
+    s = _strip_after_labels(s)
+    # 数字や記号で終わっていたら落とす（住所・年月日の取り込み対策）
+    s = re.sub(r"[\d\-/.]+$", "", s)
     return s.strip()
 
-
 # ── 氏名バリデーション（住所語や項目ラベル、医療機関語を弾く） ──
-BAD_ANY_TOKEN = r"(クリニック|病院|医院|医療法人|治療院|薬局|センター|大学|財団|協会|組合|科|御中|貴院|貴社)"
+# ▼ 既存の BAD_ANY_TOKEN を拡張（住所をより弾く）
+BAD_ANY_TOKEN = r"(クリニック|病院|医院|医療法人|治療院|薬局|センター|大学|財団|協会|組合|科|御中|貴院|貴社|市|区|町|村|丁目|番地|荘|マンション|アパート|ビル)"
+
+def _is_valid_person_tokens(g1: str, g2: str, role: str) -> bool:
+    if re.search(r"\d", g1) or re.search(r"\d", g2):
+        return False
+    if re.search(BAD_ANY_TOKEN, g1) or re.search(BAD_ANY_TOKEN, g2):
+        return False
+    if g1 in BAD_ANY_EXACT or g2 in BAD_ANY_EXACT:
+        return False
+    if role == "patient" and (g1 in BAD_PATIENT_EXACT or g2 in BAD_PATIENT_EXACT):
+        return False
+    # 一文字×一文字（例：大 昭）は原則棄却（稀例は下流で様付きなどで拾える）
+    if len(g1) == 1 and len(g2) == 1:
+        return False
+    return True
+
 BAD_PATIENT_EXACT = {"生年月日", "住所", "電話番号", "電話", "郵便番号", "患者", "氏名",
                      "保険者番号", "記号", "番号"}
 BAD_ANY_EXACT = {"氏名", "患者", "医師", "保険医"}
@@ -216,32 +255,56 @@ def detect_category(text: str) -> str:
 
 
 # ---------- 項目抽出 ----------
+# ▼ 既存 _fullname_on_same_line_after を置き換え（良い候補を後方優先で選別）
 def _fullname_on_same_line_after(label: str, t: str):
-    """ラベルと同じ行の後方にあるフルネームを拾う（住所→氏名の並び救済）。"""
-    m = re.search(label + r"\s*[:：]?[^\n]*", t)  # ラベルから改行まで
+    m = re.search(label + r"\s*[:：]?[^\n]*", t)
     if not m:
         return None
-    line = m.group(0)
+    line = _strip_after_labels(m.group(0))  # ラベル語以降は切り落とす
     cands = list(re.finditer(FULLNAME_SEP, line)) or list(re.finditer(FULLNAME_CONTIG, line))
-    for g in reversed(cands):  # 行末側を優先
-        cand = _join_fullname(g.group(1), g.group(2))
-        if not _looks_addressy(cand):
+    for g in reversed(cands):
+        g1, g2 = g.group(1), g.group(2)
+        if g1 == g2:
+            # 「上野 上野 みどり」のような重複に強い：直後に3語目があれば差し替え
+            tail = line[g.end():g.end()+20]
+            nxt = re.match(r"\s*([ぁ-んァ-ンー一-龥々〆ヵヶA-Za-z]{1,15})", tail)
+            if nxt and nxt.group(1) != g2:
+                g2 = nxt.group(1)
+        cand = _join_fullname(g1, g2)
+        if cand and not _looks_addressy(cand) and _is_valid_person_tokens(g1, g2, "patient"):
             return cand
     return None
 
+# ▼ 既存 _fullname_on_next_line_after も軽く強化
 def _fullname_on_next_line_after(label: str, t: str):
-    """ラベルの次の行頭にフルネームがあるケースを拾う。"""
     m = re.search(label + r"\s*[:：]?.*?\n", t)
     if not m:
         return None
     start = m.end()
-    next_line = t[start:start+120]  # 次行の先頭のみ見る（過剰一致防止）
+    next_line = _strip_after_labels(t[start:start+120])
     g = re.search(FULLNAME_SEP, next_line) or re.search(FULLNAME_CONTIG, next_line)
     if g:
-        cand = _join_fullname(g.group(1), g.group(2))
-        if not _looks_addressy(cand):
+        g1, g2 = g.group(1), g.group(2)
+        cand = _join_fullname(g1, g2)
+        if cand and not _looks_addressy(cand) and _is_valid_person_tokens(g1, g2, "patient") and g1 != g2:
             return cand
     return None
+
+def _name_after_label_window(lb: str, t: str):
+    m = re.search(lb + r"\s*[:：]?\s*([^\n]{0,80})", t)
+    if not m:
+        return None
+    win = _strip_after_labels(m.group(1))
+    # 行内でフルネーム探索（区切り/連結の両対応）
+    g = re.search(FULLNAME_SEP, win) or re.search(FULLNAME_CONTIG, win)
+    if not g:
+        return None
+    g1, g2 = g.group(1), g.group(2)
+    cand = _join_fullname(g1, g2)
+    if cand and not _looks_addressy(cand) and _is_valid_person_tokens(g1, g2, "patient") and g1 != g2:
+        return cand
+    return None
+
 
 def _fullname_after_broken_shimei(t: str):
     """
@@ -256,18 +319,29 @@ def _fullname_after_broken_shimei(t: str):
             return _join_fullname(g.group(1), g.group(2))
     return None
 
-
+# ▼ 既存 extract_patient を置き換え
 def extract_patient(text: str):
     t = normalize_text(text)
-
     TAIL_SAMA = r"(?:\s*(?:様|樣)(?:の|は|です|で|に)?|\s*さま)"
 
     def _accept(g1: str, g2: str):
         cand = _join_fullname(g1, g2)
-        return cand if not _looks_addressy(cand) else None
+        return cand if cand and not _looks_addressy(cand) and _is_valid_person_tokens(g1, g2, "patient") else None
 
-    # ★ ラベルを拡張（患者様氏名/患者様名にも対応）
-    for lb in [r"患者氏名", r"患者名", r"患者様氏名", r"患者様名", r"被保険者氏名", r"被保険者名"]:
+    LABELS = [r"患者氏名", r"患者名", r"患者様氏名", r"患者様名", r"被保険者氏名", r"被保険者名"]
+
+    # 0) 様付き（保険証など）最優先
+    m = re.search(FULLNAME_SEP + TAIL_SAMA, t) or re.search(FULLNAME_CONTIG + TAIL_SAMA, t)
+    if m:
+        cand = _join_fullname(m.group(1), m.group(2))
+        if cand and not _looks_addressy(cand):
+            return cand
+
+    # 1) ラベル直後の「窓取り」→ 最後に既存逐次探索
+    for lb in LABELS:
+        cand = _name_after_label_window(lb, t)
+        if cand:
+            return cand
         m = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_SEP, t)
         if m:
             cand = _accept(m.group(1), m.group(2))
@@ -277,41 +351,18 @@ def extract_patient(text: str):
             cand = _accept(m2.group(1), m2.group(2))
             if cand: return cand
         fn = _fullname_on_same_line_after(lb, t)
-        if fn and not _looks_addressy(fn): return fn
+        if fn: return fn
         fn2 = _fullname_on_next_line_after(lb, t)
-        if fn2 and not _looks_addressy(fn2): return fn2
+        if fn2: return fn2
 
-    # （以下は既存ロジックそのまま）
-    excl = r"(?<!保険医)(?<!医師)(?<!施術者)(?<!担当者)(?<!保険者)(?<!被保険者)"
-    m = re.search(excl + r"氏名\s*[:：]?\s*" + FULLNAME_SEP, t)
+    # 2) ラベルなしでも「患者 …」近傍で拾う（窓取り）
+    m = re.search(r"(患者[^\n]{0,60})", t)
     if m:
-        cand = _accept(m.group(1), m.group(2))
-        if cand: return cand
-    m = re.search(excl + r"氏名\s*[:：]?\s*" + FULLNAME_CONTIG, t)
-    if m:
-        cand = _accept(m.group(1), m.group(2))
-        if cand: return cand
-    fn3 = _fullname_on_same_line_after(excl + r"氏名", t)
-    if fn3 and not _looks_addressy(fn3): return fn3
+        cand = _name_after_label_window("患者", m.group(1))
+        if cand:
+            return cand
 
-    m = re.search(r"患者[^\n]{0,30}" + FULLNAME_SEP, t)
-    if m:
-        cand = _accept(m.group(1), m.group(2))
-        if cand: return cand
-    m = re.search(r"患者[^\n]{0,30}" + FULLNAME_CONTIG, t)
-    if m:
-        cand = _accept(m.group(1), m.group(2))
-        if cand: return cand
-
-    m = re.search(FULLNAME_SEP + TAIL_SAMA, t)
-    if m:
-        cand = _join_fullname(m.group(1), m.group(2))
-        if not _looks_addressy(cand): return cand
-    m = re.search(FULLNAME_CONTIG + TAIL_SAMA, t)
-    if m:
-        cand = _join_fullname(m.group(1), m.group(2))
-        if not _looks_addressy(cand): return cand
-
+    # 3) 「氏…名」割れ救済
     fn_broken = _fullname_after_broken_shimei(t)
     if fn_broken and not _looks_addressy(fn_broken):
         return fn_broken
