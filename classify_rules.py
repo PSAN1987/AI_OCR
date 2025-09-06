@@ -335,15 +335,11 @@ def extract_doctor(text: str):
     return None  # 片方だけは未採用
 
 def extract_client(text: str):
-    t = normalize_text(text)
-    # ★ バリエーション拡張：営業先/配布先/事業所名
-    m = re.search(r"(営業先|営業先配布場所|配布先|宛先|会社名|取引先|事業所名)\s*[:：]?\s*([^\n\r\t 　]{2,50})", t)
+    m = re.search(r"(営業先|会社名|取引先)\s*[:：]?\s*([^\n\r\t 　]{2,50})", text)
     return m.group(2).strip() if m else None
 
 def extract_client_dept(text: str):
-    t = normalize_text(text)
-    # ★ 配布先担当者/担当区の表記ゆれ
-    m = re.search(r"(配布先担当者|担当|担当区|部署|部|課)\s*[:：]?\s*([^\n\r\t 　]{2,50})", t)
+    m = re.search(r"(担当|担当区|部署|部|課)\s*[:：]?\s*([^\n\r\t 　]{2,50})", text)
     return m.group(2).strip() if m else None
 
 # 施設名の語尾（増強）
