@@ -39,6 +39,9 @@ def normalize_text(t: str) -> str:
     t = re.sub(r"基\s*本\s*情\s*報", "基本情報", t)
     t = re.sub(r"送\s*付\s*状", "送付状", t)
 
+    # 旧字体の統一（樣 → 様）
+    t = t.replace("樣", "様")
+
     return t
 
 # ---------- フルネーム判定 ----------
@@ -205,6 +208,20 @@ def _fullname_on_next_line_after(label: str, t: str):
             return cand
     return None
 
+def _fullname_after_broken_shimei(t: str):
+    """
+    同一行内で「氏 … 名」のように割れているケースを救済し、
+    その行の末尾側にあるフルネームを返す。
+    """
+    for m in re.finditer(r"氏[^\n]{0,40}名[^\n]*", t):
+        line = m.group(0)
+        cands = list(re.finditer(FULLNAME_SEP, line)) or list(re.finditer(FULLNAME_CONTIG, line))
+        if cands:
+            g = cands[-1]
+            return _join_fullname(g.group(1), g.group(2))
+    return None
+
+
 def extract_patient(text: str):
     """
     フルネーム必須。ラベル崩れ・住所混入・改行区切り・「様の」等に頑健。
@@ -212,8 +229,8 @@ def extract_patient(text: str):
     """
     t = normalize_text(text)
 
-    # 「…様の/様は/様です/さま」も許容（保険証など）
-    TAIL_SAMA = r"(?:\s*様(?:の|は|です|で|に)?|\s*さま)"
+    # 「…様の/様は/様です/さま」＋旧字体「樣」に対応
+    TAIL_SAMA = r"(?:\s*(?:様|樣)(?:の|は|です|で|に)?|\s*さま)"
 
     def _accept(g1: str, g2: str):
         cand = _join_fullname(g1, g2)  # ※ 末尾「生年月日」等の除去は _join_fullname で実施済み
@@ -263,12 +280,17 @@ def extract_patient(text: str):
     # 4) 「…様」（助詞つき/ひらがな さま もOK）
     m = re.search(FULLNAME_SEP + TAIL_SAMA, t)
     if m:
-        cand = _accept(m.group(1), m.group(2))
-        if cand: return cand
+        cand = _join_fullname(m.group(1), m.group(2))
+        if not _looks_addressy(cand): return cand
     m = re.search(FULLNAME_CONTIG + TAIL_SAMA, t)
     if m:
-        cand = _accept(m.group(1), m.group(2))
-        if cand: return cand
+        cand = _join_fullname(m.group(1), m.group(2))
+        if not _looks_addressy(cand): return cand
+
+    # 2'') 「氏 … 名」割れの救済（同一行）
+    fn_broken = _fullname_after_broken_shimei(t)
+    if fn_broken and not _looks_addressy(fn_broken):
+        return fn_broken
 
     return None  # フルネーム未満は採用しない
 
