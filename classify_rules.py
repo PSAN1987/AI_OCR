@@ -5,28 +5,29 @@ import re
 from datetime import datetime
 import unicodedata
 
+# ---------- 正規化 ----------
 def normalize_text(t: str) -> str:
     if not t:
         return ""
     t = unicodedata.normalize("NFKC", t)
     t = t.replace("　", " ")
     t = re.sub(r"[ \t]+", " ", t)  # 連続空白を1つに
-
-    # 住所・氏名ラベルの崩れを補正
+    # ラベル/住所の崩れ補正
     t = re.sub(r"住\s*所", "住所", t)  # 「住 所」→「住所」
     t = re.sub(r"(患者|被保険者|保険医|医師)\s*氏\s*(?:所\s*)?名", r"\1氏名", t)  # 「患者 氏 所名」→「患者氏名」
     t = re.sub(r"氏\s*(?:所\s*)?名", "氏名", t)
     return t
 
-# 2. フルネーム判定用のパターン
+# ---------- フルネーム判定 ----------
 NAME_TOKEN = r"[一-龥々〆ヵヶァ-ンーA-Za-z]{1,15}"
-FULLNAME_SEP    = rf"({NAME_TOKEN})[\s･・]+({NAME_TOKEN})"   # ← \s を許容（改行OK）
-FULLNAME_CONTIG = rf"({NAME_TOKEN})({NAME_TOKEN})"
+# 区切りに \s を許容（改行もOK）
+FULLNAME_SEP    = rf"({NAME_TOKEN})[\s･・]+({NAME_TOKEN})"   # 例: 佐藤 太郎 / 佐藤･太郎 / 佐藤\n太郎
+FULLNAME_CONTIG = rf"({NAME_TOKEN})({NAME_TOKEN})"           # 例: 佐藤太郎
 
 def _join_fullname(g1: str, g2: str) -> str:
     return f"{g1}{g2}"
 
-# --- カテゴリごとのキーワードセット ---
+# ---------- カテゴリキーワード ----------
 KEYWORDS = {
     "同意書": [
         r"同意書", r"同意", r"承諾", r"署名", r"サイン", r"Consent",
@@ -40,7 +41,6 @@ KEYWORDS = {
         r"治療報告書", r"報告書", r"所見", r"診断", r"経過",
         r"再評価", r"施術計画|治療計画", r"症状|疼痛|ROM|機能評価",
     ],
-    # 🔹 患者リストを強化
     "患者リスト": [
         r"患者リスト", r"患者一覧", r"Patient\s*List", r"患者台帳",
         r"フェイスシート", r"利用者情報", r"患者情報", r"ご利用者様",
@@ -63,45 +63,54 @@ KEYWORDS = {
     ],
 }
 
+# ---------- 日付 ----------
 DATE_PATTERNS = [
     r"(20\d{2})[./年-](\d{1,2})[./月-](\d{1,2})日?",
     r"(20\d{2})-(\d{1,2})-(\d{1,2})",
     r"(20\d{2})/(\d{1,2})/(\d{1,2})",
+    r"令和\s*(\d{1,2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?",
 ]
 
-# --- 分類 ---
+def extract_date(text: str):
+    t = normalize_text(text)
+    for p in DATE_PATTERNS:
+        m = re.search(p, t)
+        if m:
+            if "令和" in p:
+                y = 2018 + int(m.group(1))  # 令和1=2019
+                mo, d = m.group(2), m.group(3)
+            else:
+                y, mo, d = m.groups()
+            return f"{int(y):04d}{int(mo):02d}{int(d):02d}"
+    return None
+
+# ---------- 分類 ----------
 def detect_category(text: str) -> str:
     """
     複数キーワード一致数でスコアリングし、最もスコアが高いカテゴリを返す。
     """
-    t = text.replace("　", " ")
+    t = normalize_text(text)  # ★ 正規化してから判定
     scores = {k: 0 for k in KEYWORDS.keys()}
     for cat, pats in KEYWORDS.items():
         for pat in pats:
             matches = re.findall(pat, t, flags=re.IGNORECASE)
             if matches:
-                # ヒット回数を加点
                 scores[cat] += len(matches)
     best = max(scores, key=lambda k: scores[k])
     return best if scores[best] > 0 else "その他"
 
-# --- 日付抽出 ---
-def extract_date(text: str):
-    for p in DATE_PATTERNS:
-        m = re.search(p, text)
-        if m:
-            y, mo, d = m.groups()
-            return f"{int(y):04d}{int(mo):02d}{int(d):02d}"
+# ---------- 項目抽出 ----------
+def _fullname_on_same_line_after(label: str, t: str):
+    m = re.search(label + r"\s*[:：]?[^\n]*", t)  # ラベルから改行まで
+    if not m:
+        return None
+    line = m.group(0)
+    # 行の後ろ側のフルネームを優先（住所の後ろに氏名がある想定）
+    cands = list(re.finditer(FULLNAME_SEP, line)) or list(re.finditer(FULLNAME_CONTIG, line))
+    if cands:
+        g = cands[-1]
+        return _join_fullname(g.group(1), g.group(2))
     return None
-
-# --- 各種項目抽出 ---
-# 既存にあれば流用、なければ追記
-NAME_TOKEN = r"[一-龥々〆ヵヶァ-ンーA-Za-z]{1,15}"
-FULLNAME_SEP    = rf"({NAME_TOKEN})[ ･・]+({NAME_TOKEN})"   # 佐藤 太郎 / 佐藤･太郎
-FULLNAME_CONTIG = rf"({NAME_TOKEN})({NAME_TOKEN})"          # 佐藤太郎（連結）
-
-def _join_fullname(g1: str, g2: str) -> str:
-    return f"{g1}{g2}"
 
 def extract_patient(text: str):
     t = normalize_text(text)
@@ -134,29 +143,16 @@ def extract_patient(text: str):
     m = re.search(FULLNAME_CONTIG + r"\s*様\b", t)
     if m: return _join_fullname(m.group(1), m.group(2))
 
-    return None
-
-def _fullname_on_same_line_after(label: str, t: str):
-    m = re.search(label + r"\s*[:：]?[^\n]*", t)  # ラベルから改行まで
-    if not m:
-        return None
-    line = m.group(0)
-    # 行の後ろ側のフルネームを優先（住所の後ろに氏名がある想定）
-    cands = list(re.finditer(FULLNAME_SEP, line)) or list(re.finditer(FULLNAME_CONTIG, line))
-    if cands:
-        g = cands[-1]
-        return _join_fullname(g.group(1), g.group(2))
-    return None
+    return None  # フルネーム未満は採用しない
 
 def extract_doctor(text: str):
     t = normalize_text(text)
     for lb in [r"保険医氏名", r"医師氏名", r"医師名", r"担当医", r"先生", r"Dr", r"Doctor"]:
-        m = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_SEP, t, flags=re.IGNORECASE)
-        if m: return _join_fullname(m.group(1), m.group(2))
-        m = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_CONTIG, t, flags=re.IGNORECASE)
-        if m: return _join_fullname(m2.group(1), m2.group(2))
-    return None
-
+        m_sep = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_SEP, t, flags=re.IGNORECASE)
+        if m_sep: return _join_fullname(m_sep.group(1), m_sep.group(2))
+        m_contig = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_CONTIG, t, flags=re.IGNORECASE)
+        if m_contig: return _join_fullname(m_contig.group(1), m_contig.group(2))
+    return None  # 片方だけは未採用
 
 def extract_client(text: str):
     m = re.search(r"(営業先|会社名|取引先)\s*[:：]?\s*([^\n\r\t 　]{2,50})", text)
@@ -180,9 +176,7 @@ def extract_invoice_clinic(text: str):
     m = re.search(r"([^\s\n\r]{2,50}(治療院|クリニック|医院|病院|医科|歯科|整骨院|接骨院))[ 　]*(御中|貴院|貴社)?", t)
     return m.group(1).strip() if m else None
 
-# --- ファイル名生成 ---
-# 追加: 先頭付近のimportsのままでOK（re, datetimeは既にあります）
-
+# ---------- ファイル名生成 ----------
 def _sanitize_filename(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]+', "_", name).strip() or "不明"
 
@@ -213,26 +207,6 @@ def _tokens(text: str, patient: str, doctor: str, date_str: str) -> dict:
     }
     return tokens
 
-DATE_PATTERNS = [
-    r"(20\d{2})[./年-](\d{1,2})[./月-](\d{1,2})日?",
-    r"(20\d{2})-(\d{1,2})-(\d{1,2})",
-    r"(20\d{2})/(\d{1,2})/(\d{1,2})",
-    r"令和\s*(\d{1,2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?",
-]
-
-def extract_date(text: str):
-    t = normalize_text(text)
-    for p in DATE_PATTERNS:
-        m = re.search(p, t)
-        if m:
-            if "令和" in p:
-                y = 2018 + int(m.group(1))  # 令和1=2019
-                mo, d = m.group(2), m.group(3)
-            else:
-                y, mo, d = m.groups()
-            return f"{int(y):04d}{int(mo):02d}{int(d):02d}"
-    return None
-
 # カテゴリ別テンプレート（あとから差し替え可能）
 NAMING_TEMPLATES = {
     "同意書":      "同意書_{patient}_{doctor}_{date}",
@@ -251,7 +225,6 @@ def build_filename(category: str,
                    ext: str,
                    text: str) -> str:
     toks = _tokens(text, patient, doctor, date_str)
-    # テンプレートがなければ従来に近い汎用形式へ
     tmpl = NAMING_TEMPLATES.get(category, "{cat}_{patient}_{date}")
     name = tmpl.format_map({**toks, "cat": category})
     name = _compact(name)
