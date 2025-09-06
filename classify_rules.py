@@ -31,7 +31,14 @@ def normalize_text(t: str) -> str:
     t = re.sub(r"接\s*骨\s*院", "接骨院", t)
     t = re.sub(r"ク\s*リ\s*ニ\s*ッ\s*ク", "クリニック", t)
     t = re.sub(r"訪\s*問\s*マ\s*ッ\s*サ\s*ー\s*ジ", "訪問マッサージ", t)
-    return t
+
+    # 相談支援/基本情報 系の割れ補正
+    t = re.sub(r"相\s*談\s*支\s*援\s*事\s*業\s*所", "相談支援事業所", t)
+    t = re.sub(r"計\s*画\s*作\s*成\s*担\s*当\s*者", "計画作成担当者", t)
+    t = re.sub(r"申\s*請\s*者\s*の\s*現\s*状", "申請者の現状", t)
+    t = re.sub(r"基\s*本\s*情\s*報", "基本情報", t)
+    t = re.sub(r"送\s*付\s*状", "送付状", t)
+
     return t
 
 # ---------- フルネーム判定 ----------
@@ -111,7 +118,7 @@ KEYWORDS = {
         r"療養費支給申請書", r"あんま|マッサージ", r"施術内訳",
         r"施術日|施術年月日", r"往療", r"通院", r"施術回数|回数",
         r"単価", r"小計|合計|総計|総費用", r"施術者|施術管理者",
-        r"申請者", r"審査", r"公費負担", r"受給者番号", r"摘要",
+        r"審査", r"公費負担", r"受給者番号", r"摘要",
     ],
 }
 
@@ -137,20 +144,35 @@ def extract_date(text: str):
             return f"{int(y):04d}{int(mo):02d}{int(d):02d}"
     return None
 
-# ---------- 分類 ----------
 def detect_category(text: str) -> str:
-    """
-    複数キーワード一致数でスコアリングし、最もスコアが高いカテゴリを返す。
-    ヒットが無ければ「その他」。
-    """
-    t = normalize_text(text)  # 正規化後に判定
+    t = normalize_text(text)
+
+    # ★ 患者リストの強キーワード（見つけたら即決）
+    STRONG_PATIENTLIST = [
+        r"患者(一覧|台帳)", r"Patient\s*List", r"フェイスシート",
+        r"利用者基本情報", r"基本情報", r"ご利用者様", r"申請者の現状"
+    ]
+    for pat in STRONG_PATIENTLIST:
+        if re.search(pat, t, flags=re.IGNORECASE):
+            return "患者リスト"
+
+    # （従来のスコアリングに続く）
     scores = {k: 0 for k in KEYWORDS.keys()}
     for cat, pats in KEYWORDS.items():
         for pat in pats:
-            matches = re.findall(pat, t, flags=re.IGNORECASE)
-            if matches:
-                scores[cat] += len(matches)
+            hits = re.findall(pat, t, flags=re.IGNORECASE)
+            if hits:
+                scores[cat] += len(hits)
+
     best = max(scores, key=lambda k: scores[k])
+
+    # ★ タイブレーク：実績より患者リストを優先したいシグナル
+    if best == "実績":
+        # 相談支援/基本情報 系の語があり、「療養費」系が無いなら 患者リストへ倒す
+        if (re.search(r"(相談支援|相談支援事業所|計画作成担当者|基本情報)", t)
+            and not re.search(r"(療養費|療養費支給申請書)", t)):
+            return "患者リスト"
+
     return best if scores[best] > 0 else "その他"
 
 # ---------- 項目抽出 ----------
