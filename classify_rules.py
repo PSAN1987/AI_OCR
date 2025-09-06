@@ -10,22 +10,19 @@ def normalize_text(t: str) -> str:
         return ""
     t = unicodedata.normalize("NFKC", t)
     t = t.replace("　", " ")
-    t = re.sub(r"[ \t]+", " ", t)
-    # ラベルの分割（例: 患者 氏 名 / 保険医 氏 名）を結合
-    t = re.sub(r"(患者|被保険者|保険医|医師)\s*氏\s*名", r"\1氏名", t)
-    t = re.sub(r"氏\s*名", "氏名", t)
+    t = re.sub(r"[ \t]+", " ", t)  # 連続空白を1個に
+
+    # ラベル崩れを正規化（例: 患者 氏 所名 → 患者氏名）
+    t = re.sub(r"(患者|被保険者|保険医|医師)\s*氏\s*(?:所\s*)?名", r"\1氏名", t)
+    t = re.sub(r"氏\s*(?:所\s*)?名", "氏名", t)  # 単独パターンも救済
     return t
 
 # 2. フルネーム判定用のパターン
 NAME_TOKEN = r"[一-龥々〆ヵヶァ-ンーA-Za-z]{1,15}"
-# 区切りありのフルネーム（空白/中黒）
-FULLNAME_SEP = rf"({NAME_TOKEN})[ ･・]+({NAME_TOKEN})"
-# 区切りなしのフルネーム（例: 山田太郎／カタカナ連結）
-# → 2トークン連結とみなす（最短一致で頭2トークンを拾う）
-FULLNAME_CONTIG = rf"({NAME_TOKEN})({NAME_TOKEN})"
+FULLNAME_SEP    = rf"({NAME_TOKEN})[ ･・]+({NAME_TOKEN})"   # 佐藤 太郎 / 佐藤･太郎
+FULLNAME_CONTIG = rf"({NAME_TOKEN})({NAME_TOKEN})"          # 佐藤太郎（連結）
 
 def _join_fullname(g1: str, g2: str) -> str:
-    # ファイル名用にスペース・中黒は除去（「可知美恵子」形式）
     return f"{g1}{g2}"
 
 
@@ -98,55 +95,54 @@ def extract_date(text: str):
     return None
 
 # --- 各種項目抽出 ---
+# 既存にあれば流用、なければ追記
+NAME_TOKEN = r"[一-龥々〆ヵヶァ-ンーA-Za-z]{1,15}"
+FULLNAME_SEP    = rf"({NAME_TOKEN})[ ･・]+({NAME_TOKEN})"   # 佐藤 太郎 / 佐藤･太郎
+FULLNAME_CONTIG = rf"({NAME_TOKEN})({NAME_TOKEN})"          # 佐藤太郎（連結）
+
+def _join_fullname(g1: str, g2: str) -> str:
+    return f"{g1}{g2}"
+
 def extract_patient(text: str):
     t = normalize_text(text)
 
-    # まずは明示ラベルを優先
-    label_patterns = [r"患者氏名", r"患者名", r"被保険者氏名", r"被保険者名"]
-    for lb in label_patterns:
-        # 例: 患者氏名 佐藤 太郎 ／ 患者名 佐藤太郎
+    # 1) 明示ラベルを最優先
+    for lb in [r"患者氏名", r"患者名", r"被保険者氏名", r"被保険者名"]:
         m = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_SEP, t)
-        if m:
-            return _join_fullname(m.group(1), m.group(2))
-        m2 = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_CONTIG, t)
-        if m2:
-            return _join_fullname(m2.group(1), m2.group(2))
+        if m:  return _join_fullname(m.group(1), m.group(2))
+        m = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_CONTIG, t)
+        if m:  return _join_fullname(m.group(1), m.group(2))
 
-    # 汎用「氏名」だが、保険医/医師/施術者/担当者/保険者/被保険者 由来は除外
+    # 2) 「氏名」ラベル（ただし保険医/医師/施術者/担当者/保険者/被保険者の氏名は除外）
     excl = r"(?<!保険医)(?<!医師)(?<!施術者)(?<!担当者)(?<!保険者)(?<!被保険者)"
     m = re.search(excl + r"氏名\s*[:：]?\s*" + FULLNAME_SEP, t)
-    if m:
-        return _join_fullname(m.group(1), m.group(2))
-    m2 = re.search(excl + r"氏名\s*[:：]?\s*" + FULLNAME_CONTIG, t)
-    if m2:
-        return _join_fullname(m2.group(1), m2.group(2))
+    if m:  return _join_fullname(m.group(1), m.group(2))
+    m = re.search(excl + r"氏名\s*[:：]?\s*" + FULLNAME_CONTIG, t)
+    if m:  return _join_fullname(m.group(1), m.group(2))
 
-    # 「フルネーム様」パターン（例: 佐藤 太郎 様 / 佐藤太郎 様）
+    # 3) 患者という語の直後〜同一行内にフルネーム（ラベル崩れ救済）
+    m = re.search(r"患者[^\n]{0,30}" + FULLNAME_SEP, t)
+    if m:  return _join_fullname(m.group(1), m.group(2))
+    m = re.search(r"患者[^\n]{0,30}" + FULLNAME_CONTIG, t)
+    if m:  return _join_fullname(m.group(1), m.group(2))
+
+    # 4) 「…様」フォールバック（フルネームのみ）
     m = re.search(FULLNAME_SEP + r"\s*様\b", t)
-    if m:
-        return _join_fullname(m.group(1), m.group(2))
-    m2 = re.search(FULLNAME_CONTIG + r"\s*様\b", t)
-    if m2:
-        return _join_fullname(m2.group(1), m2.group(2))
+    if m:  return _join_fullname(m.group(1), m.group(2))
+    m = re.search(FULLNAME_CONTIG + r"\s*様\b", t)
+    if m:  return _join_fullname(m.group(1), m.group(2))
 
-    # ここまで見つからなければ “不明” 扱い（フルネーム未満は返さない）
-    return None
+    return None  # フルネーム未満は採用しない
+
 
 def extract_doctor(text: str):
     t = normalize_text(text)
-    # 医師系ラベルを網羅（保険医氏名を最優先）
-    label_patterns = [r"保険医氏名", r"医師氏名", r"医師名", r"担当医", r"先生", r"Dr", r"Doctor"]
-
-    for lb in label_patterns:
+    for lb in [r"保険医氏名", r"医師氏名", r"医師名", r"担当医", r"先生", r"Dr", r"Doctor"]:
         m = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_SEP, t, flags=re.IGNORECASE)
-        if m:
-            return _join_fullname(m.group(1), m.group(2))
-        m2 = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_CONTIG, t, flags=re.IGNORECASE)
-        if m2:
-            return _join_fullname(m2.group(1), m2.group(2))
-
-    # 医師名に「様」は通常付かないので “様” フォールバックは無し
-    return None
+        if m:  return _join_fullname(m.group(1), m.group(2))
+        m = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_CONTIG, t, flags=re.IGNORECASE)
+        if m:  return _join_fullname(m.group(1), m.group(2))
+    return None  # 片方だけは未採用
 
 
 def extract_client(text: str):
@@ -158,7 +154,8 @@ def extract_client_dept(text: str):
     return m.group(2).strip() if m else None
 
 def extract_clinic(text: str):
-    m = re.search(r"([^\s\n\r]{2,30}(治療院|クリニック|医院))", text)
+    t = normalize_text(text)
+    m = re.search(r"([^\s\n\r]{2,30}(治療院|クリニック|医院|病院|医科|歯科|整骨院|接骨院))", t)
     return m.group(1).strip() if m else None
 
 def extract_staff(text: str):
@@ -166,10 +163,9 @@ def extract_staff(text: str):
     return m.group(2).strip() if m else None
 
 def extract_invoice_clinic(text: str):
-    m = re.search(r"([^\s\n\r]{2,50}(治療院|クリニック|医院))[ 　]*(御中)?", text)
-    if m:
-        return m.group(1).strip()
-    return None
+    t = normalize_text(text)
+    m = re.search(r"([^\s\n\r]{2,50}(治療院|クリニック|医院|病院|医科|歯科|整骨院|接骨院))[ 　]*(御中|貴院|貴社)?", t)
+    return m.group(1).strip() if m else None
 
 # --- ファイル名生成 ---
 # 追加: 先頭付近のimportsのままでOK（re, datetimeは既にあります）
@@ -203,6 +199,26 @@ def _tokens(text: str, patient: str, doctor: str, date_str: str) -> dict:
         "invoice_clinic": _sanitize_filename(extract_invoice_clinic(text) or (extract_clinic(text) or "治療院不明")),
     }
     return tokens
+
+DATE_PATTERNS = [
+    r"(20\d{2})[./年-](\d{1,2})[./月-](\d{1,2})日?",
+    r"(20\d{2})-(\d{1,2})-(\d{1,2})",
+    r"(20\d{2})/(\d{1,2})/(\d{1,2})",
+    r"令和\s*(\d{1,2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?",
+]
+
+def extract_date(text: str):
+    t = normalize_text(text)
+    for p in DATE_PATTERNS:
+        m = re.search(p, t)
+        if m:
+            if "令和" in p:
+                y = 2018 + int(m.group(1))  # 令和1=2019
+                mo, d = m.group(2), m.group(3)
+            else:
+                y, mo, d = m.groups()
+            return f"{int(y):04d}{int(mo):02d}{int(d):02d}"
+    return None
 
 # カテゴリ別テンプレート（あとから差し替え可能）
 NAMING_TEMPLATES = {
