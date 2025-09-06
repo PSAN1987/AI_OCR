@@ -3,6 +3,31 @@
 
 import re
 from datetime import datetime
+import unicodedata
+
+def normalize_text(t: str) -> str:
+    if not t:
+        return ""
+    t = unicodedata.normalize("NFKC", t)
+    t = t.replace("　", " ")
+    t = re.sub(r"[ \t]+", " ", t)
+    # ラベルの分割（例: 患者 氏 名 / 保険医 氏 名）を結合
+    t = re.sub(r"(患者|被保険者|保険医|医師)\s*氏\s*名", r"\1氏名", t)
+    t = re.sub(r"氏\s*名", "氏名", t)
+    return t
+
+# 2. フルネーム判定用のパターン
+NAME_TOKEN = r"[一-龥々〆ヵヶァ-ンーA-Za-z]{1,15}"
+# 区切りありのフルネーム（空白/中黒）
+FULLNAME_SEP = rf"({NAME_TOKEN})[ ･・]+({NAME_TOKEN})"
+# 区切りなしのフルネーム（例: 山田太郎／カタカナ連結）
+# → 2トークン連結とみなす（最短一致で頭2トークンを拾う）
+FULLNAME_CONTIG = rf"({NAME_TOKEN})({NAME_TOKEN})"
+
+def _join_fullname(g1: str, g2: str) -> str:
+    # ファイル名用にスペース・中黒は除去（「可知美恵子」形式）
+    return f"{g1}{g2}"
+
 
 # --- カテゴリごとのキーワードセット ---
 KEYWORDS = {
@@ -74,19 +99,55 @@ def extract_date(text: str):
 
 # --- 各種項目抽出 ---
 def extract_patient(text: str):
-    for label in ["患者氏名", "患者名", "氏名", "お名前", "患者", "被保険者氏名"]:
-        m = re.search(label + r"\s*[:：]?\s*([^\n\r\t 　]{2,30})", text)
+    t = normalize_text(text)
+
+    # まずは明示ラベルを優先
+    label_patterns = [r"患者氏名", r"患者名", r"被保険者氏名", r"被保険者名"]
+    for lb in label_patterns:
+        # 例: 患者氏名 佐藤 太郎 ／ 患者名 佐藤太郎
+        m = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_SEP, t)
         if m:
-            return m.group(1).strip()
-    m = re.search(r"([^\s\n\r]{2,30})\s*様", text)
-    return m.group(1).strip() if m else None
+            return _join_fullname(m.group(1), m.group(2))
+        m2 = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_CONTIG, t)
+        if m2:
+            return _join_fullname(m2.group(1), m2.group(2))
+
+    # 汎用「氏名」だが、保険医/医師/施術者/担当者/保険者/被保険者 由来は除外
+    excl = r"(?<!保険医)(?<!医師)(?<!施術者)(?<!担当者)(?<!保険者)(?<!被保険者)"
+    m = re.search(excl + r"氏名\s*[:：]?\s*" + FULLNAME_SEP, t)
+    if m:
+        return _join_fullname(m.group(1), m.group(2))
+    m2 = re.search(excl + r"氏名\s*[:：]?\s*" + FULLNAME_CONTIG, t)
+    if m2:
+        return _join_fullname(m2.group(1), m2.group(2))
+
+    # 「フルネーム様」パターン（例: 佐藤 太郎 様 / 佐藤太郎 様）
+    m = re.search(FULLNAME_SEP + r"\s*様\b", t)
+    if m:
+        return _join_fullname(m.group(1), m.group(2))
+    m2 = re.search(FULLNAME_CONTIG + r"\s*様\b", t)
+    if m2:
+        return _join_fullname(m2.group(1), m2.group(2))
+
+    # ここまで見つからなければ “不明” 扱い（フルネーム未満は返さない）
+    return None
 
 def extract_doctor(text: str):
-    for label in ["医師名", "担当医", "先生", "Dr", "Doctor"]:
-        m = re.search(label + r"\s*[:：]?\s*([^\n\r\t 　]{2,30})", text, flags=re.IGNORECASE)
+    t = normalize_text(text)
+    # 医師系ラベルを網羅（保険医氏名を最優先）
+    label_patterns = [r"保険医氏名", r"医師氏名", r"医師名", r"担当医", r"先生", r"Dr", r"Doctor"]
+
+    for lb in label_patterns:
+        m = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_SEP, t, flags=re.IGNORECASE)
         if m:
-            return m.group(1).strip()
+            return _join_fullname(m.group(1), m.group(2))
+        m2 = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_CONTIG, t, flags=re.IGNORECASE)
+        if m2:
+            return _join_fullname(m2.group(1), m2.group(2))
+
+    # 医師名に「様」は通常付かないので “様” フォールバックは無し
     return None
+
 
 def extract_client(text: str):
     m = re.search(r"(営業先|会社名|取引先)\s*[:：]?\s*([^\n\r\t 　]{2,50})", text)
