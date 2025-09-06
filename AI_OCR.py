@@ -62,6 +62,8 @@ CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 SERVICE_ACCOUNT_VALUE = os.environ.get("GCP_SERVICE_ACCOUNT_JSON", "").strip()
 VISION_API_KEY = os.environ.get("GOOGLE_VISION_API_KEY", "").strip()
 GCS_BUCKET = os.environ.get("GCS_BUCKET", "").strip()
+SPREADSHEET_KEY = os.environ.get("SPREADSHEET_KEY", "").strip()
+SPREADSHEET_NAME = "Logs"
 
 MS_TENANT_ID = os.environ.get("MS_TENANT_ID", "").strip()
 MS_CLIENT_ID = os.environ.get("MS_CLIENT_ID", "").strip()
@@ -121,6 +123,30 @@ def _sanitize_filename(name: str) -> str:
     name = re.sub(r'[\\/:*?"<>|]+', "_", name)
     name = name.replace("\n", " ").replace("\r", " ")
     return name.strip() or "unnamed"
+
+def gsheet_append_rows(rows: list[list[str]]):
+    """
+    rows: [["保存日時ISO", "保存日付YYYYMMDD", "種別", "分類", "患者", "先生", "抽出日付", "保存フォルダ", "ファイル名", "リンク", "OCR文字数", "OCR先頭100", "ステータス", "イベントID", "エラーメッセージ"]]
+    """
+    if not SPREADSHEET_KEY:
+        # 設定が無ければ黙ってスキップ（本番運用ではログにWarnしてOK）
+        return
+    token = _google_access_token(scopes=("https://www.googleapis.com/auth/spreadsheets",))
+    rng = f"{quote(SPREADSHEET_NAME)}!A1"
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{SPREADSHEET_KEY}/values/{rng}:append"
+    params = {"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"}
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    body = {"values": rows}
+    r = requests.post(url, headers=headers, params=params, json=body, timeout=30)
+    # 失敗してもメイン処理は継続させたいので raise はしない（必要ならここで例外化）
+    if r.status_code not in (200, 201):
+        try:
+            detail = r.text[:300]
+        except Exception:
+            detail = ""
+        print(f"[WARN] Sheets append failed: {r.status_code} {detail}")
+
+
 
 # ---------- OCR (Images via Vision) ----------
 def ocr_image_bytes(image_bytes: bytes) -> str:
@@ -388,6 +414,51 @@ def callback():
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image(event: MessageEvent):
     try:
+        # ...（既存）画像→OCR→分類・抽出→命名→OneDrive保存...
+        # ▼ 成功ログを追記
+        gsheet_append_rows([[
+            datetime.now().isoformat(timespec="seconds"),  # 保存日時ISO
+            date_str,                                      # 保存日付YYYYMMDD
+            "image",                                       # 種別
+            category,                                      # 分類
+            patient or "",                                 # 患者
+            doctor or "",                                  # 先生
+            date_str,                                      # 抽出日付
+            folder,                                        # 保存フォルダ
+            filename,                                      # ファイル名
+            link,                                          # リンク
+            str(len(text or "")),                          # OCR文字数
+            (text or "").replace("\n", " ")[:100],         # OCR先頭100
+            "success",                                     # ステータス
+            event.message.id,                              # イベントID
+            ""                                             # エラーメッセージ
+        ]])
+
+        # ...（既存）返信
+    except Exception as e:
+        # ▼ 失敗ログ（可能な範囲で）
+        try:
+            gsheet_append_rows([[
+                datetime.now().isoformat(timespec="seconds"),
+                _now_date_str(),
+                "image",
+                "N/A",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "0",
+                "",
+                "error",
+                getattr(event.message, "id", ""),
+                str(e)[:200]
+            ]])
+        except Exception:
+            pass
+        # ...（既存）エラー返信
+
         # 1) 画像バイト取得
         content = line_bot_api.get_message_content(event.message.id)
         image_bytes = b"".join(chunk for chunk in content.iter_content())
@@ -424,6 +495,54 @@ def handle_image(event: MessageEvent):
 @handler.add(MessageEvent, message=FileMessage)
 def handle_file(event: MessageEvent):
     try:
+        if (event.message.file_name or "").lower().endswith(".pdf"):
+            # ...（既存）PDF→OCR→分類・抽出→命名→OneDrive保存...
+            # ▼ 成功ログを追記
+            gsheet_append_rows([[
+                datetime.now().isoformat(timespec="seconds"),
+                date_str,
+                "pdf",
+                category,
+                patient or "",
+                doctor or "",
+                date_str,
+                folder,
+                filename,
+                link,
+                str(len(text or "")),
+                (text or "").replace("\n", " ")[:100],
+                "success",
+                event.message.id,
+                ""
+            ]])
+
+            # ...（既存）返信
+        else:
+            # PDF以外の案内（ログは任意）
+            pass
+    except Exception as e:
+        try:
+            gsheet_append_rows([[
+                datetime.now().isoformat(timespec="seconds"),
+                _now_date_str(),
+                "pdf",
+                "N/A",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "0",
+                "",
+                "error",
+                getattr(event.message, "id", ""),
+                str(e)[:200]
+            ]])
+        except Exception:
+            pass
+        # ...（既存）エラー返信
+
         if (event.message.file_name or "").lower().endswith(".pdf"):
             # 1) PDFバイト取得
             content = line_bot_api.get_message_content(event.message.id)
