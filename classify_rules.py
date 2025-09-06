@@ -10,21 +10,21 @@ def normalize_text(t: str) -> str:
         return ""
     t = unicodedata.normalize("NFKC", t)
     t = t.replace("　", " ")
-    t = re.sub(r"[ \t]+", " ", t)  # 連続空白を1個に
+    t = re.sub(r"[ \t]+", " ", t)  # 連続空白を1つに
 
-    # ラベル崩れを正規化（例: 患者 氏 所名 → 患者氏名）
-    t = re.sub(r"(患者|被保険者|保険医|医師)\s*氏\s*(?:所\s*)?名", r"\1氏名", t)
-    t = re.sub(r"氏\s*(?:所\s*)?名", "氏名", t)  # 単独パターンも救済
+    # 住所・氏名ラベルの崩れを補正
+    t = re.sub(r"住\s*所", "住所", t)  # 「住 所」→「住所」
+    t = re.sub(r"(患者|被保険者|保険医|医師)\s*氏\s*(?:所\s*)?名", r"\1氏名", t)  # 「患者 氏 所名」→「患者氏名」
+    t = re.sub(r"氏\s*(?:所\s*)?名", "氏名", t)
     return t
 
 # 2. フルネーム判定用のパターン
 NAME_TOKEN = r"[一-龥々〆ヵヶァ-ンーA-Za-z]{1,15}"
-FULLNAME_SEP    = rf"({NAME_TOKEN})[ ･・]+({NAME_TOKEN})"   # 佐藤 太郎 / 佐藤･太郎
-FULLNAME_CONTIG = rf"({NAME_TOKEN})({NAME_TOKEN})"          # 佐藤太郎（連結）
+FULLNAME_SEP    = rf"({NAME_TOKEN})[\s･・]+({NAME_TOKEN})"   # ← \s を許容（改行OK）
+FULLNAME_CONTIG = rf"({NAME_TOKEN})({NAME_TOKEN})"
 
 def _join_fullname(g1: str, g2: str) -> str:
     return f"{g1}{g2}"
-
 
 # --- カテゴリごとのキーワードセット ---
 KEYWORDS = {
@@ -105,44 +105,57 @@ def _join_fullname(g1: str, g2: str) -> str:
 
 def extract_patient(text: str):
     t = normalize_text(text)
-
-    # 1) 明示ラベルを最優先
+    # 1) 明示ラベル直後
     for lb in [r"患者氏名", r"患者名", r"被保険者氏名", r"被保険者名"]:
         m = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_SEP, t)
-        if m:  return _join_fullname(m.group(1), m.group(2))
-        m = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_CONTIG, t)
-        if m:  return _join_fullname(m.group(1), m.group(2))
+        if m: return _join_fullname(m.group(1), m.group(2))
+        m2 = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_CONTIG, t)
+        if m2: return _join_fullname(m2.group(1), m2.group(2))
+        # 1') 同じ行内の後方フォールバック（住所→氏名の並びを救済）
+        fn = _fullname_on_same_line_after(lb, t)
+        if fn: return fn
 
-    # 2) 「氏名」ラベル（ただし保険医/医師/施術者/担当者/保険者/被保険者の氏名は除外）
+    # 2) 「氏名」だが保険医/医師等の氏名は除外
     excl = r"(?<!保険医)(?<!医師)(?<!施術者)(?<!担当者)(?<!保険者)(?<!被保険者)"
     m = re.search(excl + r"氏名\s*[:：]?\s*" + FULLNAME_SEP, t)
-    if m:  return _join_fullname(m.group(1), m.group(2))
+    if m: return _join_fullname(m.group(1), m.group(2))
     m = re.search(excl + r"氏名\s*[:：]?\s*" + FULLNAME_CONTIG, t)
-    if m:  return _join_fullname(m.group(1), m.group(2))
+    if m: return _join_fullname(m.group(1), m.group(2))
 
-    # 3) 患者という語の直後〜同一行内にフルネーム（ラベル崩れ救済）
+    # 3) 「患者 …（最大30文字）… フルネーム」救済（同一行）
     m = re.search(r"患者[^\n]{0,30}" + FULLNAME_SEP, t)
-    if m:  return _join_fullname(m.group(1), m.group(2))
+    if m: return _join_fullname(m.group(1), m.group(2))
     m = re.search(r"患者[^\n]{0,30}" + FULLNAME_CONTIG, t)
-    if m:  return _join_fullname(m.group(1), m.group(2))
+    if m: return _join_fullname(m.group(1), m.group(2))
 
-    # 4) 「…様」フォールバック（フルネームのみ）
+    # 4) 「…様」（フルネームのみ）
     m = re.search(FULLNAME_SEP + r"\s*様\b", t)
-    if m:  return _join_fullname(m.group(1), m.group(2))
+    if m: return _join_fullname(m.group(1), m.group(2))
     m = re.search(FULLNAME_CONTIG + r"\s*様\b", t)
-    if m:  return _join_fullname(m.group(1), m.group(2))
+    if m: return _join_fullname(m.group(1), m.group(2))
 
-    return None  # フルネーム未満は採用しない
+    return None
 
+def _fullname_on_same_line_after(label: str, t: str):
+    m = re.search(label + r"\s*[:：]?[^\n]*", t)  # ラベルから改行まで
+    if not m:
+        return None
+    line = m.group(0)
+    # 行の後ろ側のフルネームを優先（住所の後ろに氏名がある想定）
+    cands = list(re.finditer(FULLNAME_SEP, line)) or list(re.finditer(FULLNAME_CONTIG, line))
+    if cands:
+        g = cands[-1]
+        return _join_fullname(g.group(1), g.group(2))
+    return None
 
 def extract_doctor(text: str):
     t = normalize_text(text)
     for lb in [r"保険医氏名", r"医師氏名", r"医師名", r"担当医", r"先生", r"Dr", r"Doctor"]:
         m = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_SEP, t, flags=re.IGNORECASE)
-        if m:  return _join_fullname(m.group(1), m.group(2))
+        if m: return _join_fullname(m.group(1), m.group(2))
         m = re.search(lb + r"\s*[:：]?\s*" + FULLNAME_CONTIG, t, flags=re.IGNORECASE)
-        if m:  return _join_fullname(m.group(1), m.group(2))
-    return None  # 片方だけは未採用
+        if m: return _join_fullname(m2.group(1), m2.group(2))
+    return None
 
 
 def extract_client(text: str):
