@@ -485,7 +485,7 @@ def handle_image(event: MessageEvent):
                 datetime.now().isoformat(timespec="seconds"),
                 date_str, kind, category, patient, doctor, "",
                 folder, filename, link, "0", "", "error",
-                getattr(event.message, "id", ""), str(e)[:300]
+                getattr(event.message, "id", ""), str(e)[:800]
             ]])
         except Exception:
             pass
@@ -538,7 +538,7 @@ def handle_file(event: MessageEvent):
                 datetime.now().isoformat(timespec="seconds"),
                 date_str, kind, category, patient or "", doctor or "", date_str,
                 folder, filename, link, str(len(text or "")),
-                (text or "").replace("\n", " ")[:300],
+                (text or "").replace("\n", " ")[:800],
                 "success", event.message.id, ""
             ]])
 
@@ -557,7 +557,7 @@ def handle_file(event: MessageEvent):
                 datetime.now().isoformat(timespec="seconds"),
                 date_str, kind, category, patient, doctor, "",
                 folder, filename, link, "0", "", "error",
-                getattr(event.message, "id", ""), str(e)[:200]
+                getattr(event.message, "id", ""), str(e)[:800]
             ]])
         except Exception:
             pass
