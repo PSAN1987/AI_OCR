@@ -26,7 +26,38 @@ FULLNAME_SEP    = rf"({NAME_TOKEN})[\s･・]+({NAME_TOKEN})"   # 例: 佐藤 �
 FULLNAME_CONTIG = rf"({NAME_TOKEN})({NAME_TOKEN})"           # 例: 佐藤太郎
 
 def _join_fullname(g1: str, g2: str) -> str:
-    return f"{g1}{g2}"
+    # フルネーム結合
+    s = f"{g1}{g2}"
+    # 末尾にくっついた「生年月日」などを素朴に除去（空白/OCRゆらぎ対応）
+    s = re.sub(r"(生\s*年\s*月\s*日|生\s*年\s*月|生年月日|生年月|誕生日|DOB)\s*$", "", s)
+    # 念のため末尾空白を除去
+    return s.strip()
+
+
+# ── 氏名バリデーション（住所語や項目ラベル、医療機関語を弾く） ──
+BAD_ANY_TOKEN = r"(クリニック|病院|医院|医療法人|治療院|薬局|センター|大学|財団|協会|組合|科|御中|貴院|貴社)"
+BAD_PATIENT_EXACT = {"生年月日", "住所", "電話番号", "電話", "郵便番号", "患者", "氏名",
+                     "保険者番号", "記号", "番号"}
+BAD_ANY_EXACT = {"氏名", "患者", "医師", "保険医"}
+
+def _is_valid_person_tokens(g1: str, g2: str, role: str) -> bool:
+    # 数字や記号だらけは不可
+    if re.search(r"\d", g1) or re.search(r"\d", g2):
+        return False
+    # クリニック/病院など、明確に人名でない語を含む場合は除外
+    if re.search(BAD_ANY_TOKEN, g1) or re.search(BAD_ANY_TOKEN, g2):
+        return False
+    # ラベルそのものや一般語をそのまま拾っていないか（完全一致で弾く）
+    if g1 in BAD_ANY_EXACT or g2 in BAD_ANY_EXACT:
+        return False
+    if role == "patient" and (g1 in BAD_PATIENT_EXACT or g2 in BAD_PATIENT_EXACT):
+        return False
+    # 異常に短すぎる/長すぎる（姓名合計 2〜10 文字程度に制限、英字名も想定）
+    total = len(g1) + len(g2)
+    if total < 2 or total > 10:
+        # 長めのカタカナ名などを許容したい場合は上限を緩めてもOK
+        pass
+    return True
 
 # 住所っぽい候補の排除（氏名誤認防止：港区新茶屋 等）
 ADDRESS_TOKENS = r"(都|道|府|県|市|区|町|村|丁目|番地|番|号|郡|荘|マンション|アパート|ビル)"
