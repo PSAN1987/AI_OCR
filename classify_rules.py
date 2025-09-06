@@ -105,7 +105,7 @@ KEYWORDS = {
         r"フェイスシート", r"利用者情報", r"患者情報", r"ご利用者様",
         r"介護状況", r"入居者情報", r"要介護", r"認定日",
         r"電話番号", r"住所", r"生年月日",
-        r"リハビリテーション総合実施計画書", r"リハビリテーション総合実施計画書",
+        r"リハビリテーション総合実施計画書", r"受入依頼票",
     ],
     "請求書": [
         r"\b請求書\b", r"INVOICE",
@@ -151,7 +151,8 @@ def detect_category(text: str) -> str:
     # ★ 患者リストの強キーワード（見つけたら即決）
     STRONG_PATIENTLIST = [
         r"患者(一覧|台帳)", r"Patient\s*List", r"フェイスシート",
-        r"利用者基本情報", r"基本情報", r"ご利用者様", r"申請者の現状"
+        r"利用者基本情報", r"基本情報", r"ご利用者様", r"申請者の現状",
+        r"リハビリテーション総合実施計画書", r"受入依頼票",
     ]
     for pat in STRONG_PATIENTLIST:
         if re.search(pat, t, flags=re.IGNORECASE):
