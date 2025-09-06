@@ -24,12 +24,14 @@ def normalize_text(t: str) -> str:
     t = re.sub(r"(患者|被保険者|保険医|医師)\s*氏\s*(?:所\s*)?名", r"\1氏名", t)
     t = re.sub(r"氏\s*(?:所\s*)?名", "氏名", t)
 
-    # ★ 医療機関ラベルの分割を結合（OCRで割れやすい語を補正）
+    # ★ 医療機関系の割れ表記を結合
     t = re.sub(r"鍼\s*灸\s*院", "鍼灸院", t)
     t = re.sub(r"針\s*灸\s*院", "針灸院", t)
     t = re.sub(r"整\s*骨\s*院", "整骨院", t)
     t = re.sub(r"接\s*骨\s*院", "接骨院", t)
     t = re.sub(r"ク\s*リ\s*ニ\s*ッ\s*ク", "クリニック", t)
+    t = re.sub(r"訪\s*問\s*マ\s*ッ\s*サ\s*ー\s*ジ", "訪問マッサージ", t)
+    return t
     return t
 
 # ---------- フルネーム判定 ----------
@@ -112,8 +114,6 @@ KEYWORDS = {
         r"申請者", r"審査", r"公費負担", r"受給者番号", r"摘要",
     ],
 }
-
-CLINIC_SUFFIX = r"(?:鍼灸院|針灸院|はりきゅう院|鍼灸整骨院|整骨院|接骨院|整体院|治療院|クリニック|医院|病院|医科|歯科|施術所)"
 
 # ---------- 日付 ----------
 DATE_PATTERNS = [
@@ -258,58 +258,63 @@ def extract_doctor(text: str):
         if m_contig: return _join_fullname(m_contig.group(1), m_contig.group(2))
     return None  # 片方だけは未採用
 
-def extract_clinic(text: str):
-    t = normalize_text(text)
-
-    # A) 「◯◯鍼灸院 御中/様/宛」パターンを最優先
-    m = re.search(rf"([^\n\r]{{2,40}}?{CLINIC_SUFFIX})\s*(?:御中|様|宛)", t)
-    if m:
-        return m.group(1).strip()
-
-    # B) 単独で現れる施設名（本文中）
-    m = re.search(rf"([^\s\n\r]{{1,40}}{CLINIC_SUFFIX})", t)
-    if m:
-        return m.group(1).strip()
-
-    # C) 「…御中/様/宛」の直前テキストに施設語が含まれる場合
-    m = re.search(r"([^\n\r]{2,40}?)\s*(?:御中|様|宛)", t)
-    if m and re.search(CLINIC_SUFFIX, m.group(1)):
-        return m.group(1).strip()
-
-    return None
+def extract_client(text: str):
+    m = re.search(r"(営業先|会社名|取引先)\s*[:：]?\s*([^\n\r\t 　]{2,50})", text)
     return m.group(2).strip() if m else None
 
 def extract_client_dept(text: str):
     m = re.search(r"(担当|担当区|部署|部|課)\s*[:：]?\s*([^\n\r\t 　]{2,50})", text)
     return m.group(2).strip() if m else None
 
+# 施設名の語尾（増強）
+CLINIC_SUFFIX = r"(?:訪問マッサージ鍼灸院|鍼灸院|針灸院|はりきゅう院|鍼灸整骨院|整骨院|接骨院|整体院|治療院|クリニック|医院|病院|医科|歯科|施術所)"
+
 def extract_clinic(text: str):
     t = normalize_text(text)
-    m = re.search(r"([^\s\n\r]{2,30}(治療院|クリニック|医院|病院|医科|歯科|整骨院|接骨院))", t)
-    return m.group(1).strip() if m else None
+
+    # A) 「◯◯[施設語] 御中/様/宛」… 最優先
+    m = re.search(rf"([^\n\r]{{2,60}}?{CLINIC_SUFFIX})\s*(?:御中|様|殿|宛)", t)
+    if m:
+        return m.group(1).strip()
+
+    # B) 本文中に単独出現
+    m = re.search(rf"([^\s\n\r]{{1,60}}{CLINIC_SUFFIX})", t)
+    if m:
+        return m.group(1).strip()
+
+    # C) 「…御中/様/宛」の直前に施設語を含む文字列
+    m = re.search(r"([^\n\r]{2,60}?)\s*(?:御中|様|殿|宛)", t)
+    if m and re.search(CLINIC_SUFFIX, m.group(1)):
+        return m.group(1).strip()
+
+    return None
+
+def extract_invoice_clinic(text: str):
+    """請求書の宛先施設名を優先的に抽出。"""
+    t = normalize_text(text)
+
+    # 1) 宛先ラベル／敬称優先
+    m = re.search(rf"([^\n\r]{{2,60}}?{CLINIC_SUFFIX})\s*(?:御中|様|殿|宛)", t)
+    if m:
+        return m.group(1).strip()
+
+    # 2) 「請求先/宛先」っぽい行（あれば）
+    m = re.search(rf"(?:請求先|宛先)\s*[:：]?\s*([^\n\r]{{2,60}}?{CLINIC_SUFFIX})", t)
+    if m:
+        return m.group(1).strip()
+
+    # 3) 一般の施設名
+    m = re.search(rf"([^\s\n\r]{{1,60}}{CLINIC_SUFFIX})", t)
+    if m:
+        return m.group(1).strip()
+
+    return None
+
 
 def extract_staff(text: str):
     m = re.search(r"(スタッフ|担当者|施術者|作成者)\s*[:：]?\s*([^\n\r\t 　]{2,30})", text)
     return m.group(2).strip() if m else None
 
-def extract_invoice_clinic(text: str):
-    """
-    請求書向けの施設名。基本は extract_clinic と同じだが、
-    '御中' をより強く優先する。
-    """
-    t = normalize_text(text)
-
-    # 1) 御中/様/宛 を強く優先
-    m = re.search(rf"([^\n\r]{{2,40}}?{CLINIC_SUFFIX})\s*(?:御中|様|宛)", t)
-    if m:
-        return m.group(1).strip()
-
-    # 2) 一般の施設名
-    m = re.search(rf"([^\s\n\r]{{1,40}}{CLINIC_SUFFIX})", t)
-    if m:
-        return m.group(1).strip()
-
-    return None
 
 # ---------- ファイル名生成 ----------
 def _sanitize_filename(name: str) -> str:
