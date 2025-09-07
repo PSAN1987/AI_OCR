@@ -413,6 +413,47 @@ def onedrive_search(query: str, max_items=5, allowed_ext=(".pdf", ".jpg", ".jpeg
         if len(results) >= max_items:
             break
     return results
+# --- 追加: ファイル名の一部完全一致マッチ用ユーティリティ＆検索 ---
+
+def _normalize_person(s: str) -> str:
+    """比較用に空白類を除去（半角/全角対応）。"""
+    return re.sub(r"[ \u3000\t]", "", s or "")
+
+def _filename_token_exact_match(file_name: str, person: str) -> bool:
+    """
+    ファイル名(拡張子除く)をトークン分割し、どれかのトークンが person と完全一致すれば True。
+    トークン区切り: _, -, スペース(半/全角), ドット, 各種括弧, スラッシュなど
+    """
+    if not file_name or not person:
+        return False
+    person_n = _normalize_person(person)
+
+    base, _ext = os.path.splitext(file_name)
+    if _normalize_person(base) == person_n:
+        return True
+
+    tokens = re.split(r"[ _\-\.\(\)【】\[\]／/　]+", base)
+    for t in tokens:
+        if _normalize_person(t) == person_n and person_n != "":
+            return True
+    return False
+
+def onedrive_search_by_filename_exact_token(person: str, max_items: int = 5, pool: int = 50):
+    """
+    Graph 検索で候補を取り、クライアント側で「ファイル名の一部完全一致」で絞り込む。
+    pool: サーバ側検索で取ってくる候補数（フィルタで減る前提なので少し多めに）
+    """
+    # ※ Graph の /search はコンテンツヒットも混ざるため、取得後に「ファイル名だけ」でフィルタする
+    candidates = onedrive_search(person, max_items=pool)
+    results = []
+    for it in candidates:
+        name = it.get("name", "")
+        if _filename_token_exact_match(name, person):
+            results.append(it)
+            if len(results) >= max_items:
+                break
+    return results
+
 
 # ---------- LINE Routes ----------
 @app.route("/", methods=["GET"])
@@ -591,7 +632,34 @@ def handle_text(event: MessageEvent):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text="検索キーワード（氏名など）を入力してください。"))
             return
 
-        # OneDrive 検索（ファイル名ヒット）
+        # ★ 追加: 「#名前 ○○○」に反応（ファイル名の一部完全一致検索）
+        m = re.match(r"^#名前\s*[:：]?\s*(.+)$", query)
+        if m:
+            person = m.group(1).strip()
+            if not person:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="使い方: #名前 佐藤太郎"))
+                return
+
+            items = onedrive_search_by_filename_exact_token(person, max_items=5, pool=50)
+            if not items:
+                line_bot_api.reply_message(
+                    event.reply_token, TextSendMessage(text=f"【名前検索】「{person}」に一致するファイル名は見つかりませんでした。"))
+                return
+
+            lines = []
+            for it in items:
+                name = it.get("name", "(no name)")
+                item_id = it.get("id")
+                try:
+                    link = create_share_link(item_id)
+                except Exception:
+                    link = it.get("webUrl", "")
+                lines.append(f"• {name}\n  {link}")
+            reply = f"【名前検索】ファイル名の一部完全一致（最大5件）\n" + "\n".join(lines)
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return  # ここで終了
+
+        # （従来の汎用検索：自由入力 → Graph の search をそのまま利用）
         items = onedrive_search(query, max_items=5)
         if not items:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"「{query}」に一致するファイルは見つかりませんでした。"))
