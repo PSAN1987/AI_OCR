@@ -623,27 +623,32 @@ def handle_file(event: MessageEvent):
             pass
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"処理失敗（PDF）: {e}"))
 
-
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event: MessageEvent):
     try:
         query = (event.message.text or "").strip()
-        if not query:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="検索キーワード（氏名など）を入力してください。"))
-            return
 
-        # ★ 追加: 「#名前 ○○○」に反応（ファイル名の一部完全一致検索）
-        m = re.match(r"^#名前\s*[:：]?\s*(.+)$", query)
+        # ★ 追加: 先頭が #/＃ でなければ完全に無反応
+        if not query or not re.match(r"^[#＃]", query):
+            return  # 返信しない
+
+        # ★ 「#名前 ...」のみ反応（全角＃/コロン対応）
+        m = re.match(r"^[#＃]名前\s*[:：]?\s*(.+)$", query)
         if m:
             person = m.group(1).strip()
             if not person:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="使い方: #名前 佐藤太郎"))
+                line_bot_api.reply_message(
+                    event.reply_token, TextSendMessage(text="使い方: #名前 佐藤太郎")
+                )
                 return
 
+            # ファイル名の一部完全一致（前回追加の関数を使用）
             items = onedrive_search_by_filename_exact_token(person, max_items=5, pool=50)
             if not items:
                 line_bot_api.reply_message(
-                    event.reply_token, TextSendMessage(text=f"【名前検索】「{person}」に一致するファイル名は見つかりませんでした。"))
+                    event.reply_token,
+                    TextSendMessage(text=f"【名前検索】「{person}」に一致するファイル名は見つかりませんでした。"),
+                )
                 return
 
             lines = []
@@ -655,30 +660,23 @@ def handle_text(event: MessageEvent):
                 except Exception:
                     link = it.get("webUrl", "")
                 lines.append(f"• {name}\n  {link}")
-            reply = f"【名前検索】ファイル名の一部完全一致（最大5件）\n" + "\n".join(lines)
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-            return  # ここで終了
 
-        # （従来の汎用検索：自由入力 → Graph の search をそのまま利用）
-        items = onedrive_search(query, max_items=5)
-        if not items:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"「{query}」に一致するファイルは見つかりませんでした。"))
+            reply = "【名前検索】ファイル名の一部完全一致（最大5件）\n" + "\n".join(lines)
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
             return
 
-        lines = []
-        for it in items:
-            name = it.get("name", "(no name)")
-            item_id = it.get("id")
-            try:
-                link = create_share_link(item_id)
-            except Exception:
-                link = it.get("webUrl", "")
-            lines.append(f"• {name}\n  {link}")
-        reply = "検索結果（最大5件）:\n" + "\n".join(lines)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        # ★ それ以外の #コマンドは無視（返信しない）
+        return
 
     except Exception as e:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"検索処理失敗: {e}"))
+        # #コマンド処理中のみエラーを返す（#なしはそもそも無反応）
+        try:
+            if re.match(r"^[#＃]", (event.message.text or "")):
+                line_bot_api.reply_message(
+                    event.reply_token, TextSendMessage(text=f"検索処理失敗: {e}")
+                )
+        except Exception:
+            pass
 
 # ---------- Local run ----------
 if __name__ == "__main__":
