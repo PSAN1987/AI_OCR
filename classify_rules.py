@@ -499,3 +499,156 @@ def build_filename(category: str,
     if len(name) > MAX_BASENAME:
         name = name[:MAX_BASENAME].rstrip("_ ").rstrip()
     return f"{name}{ext}"
+
+# ========== LLM 統合（GPT-3o mini / gpt-4o-mini 互換） ==========
+import os, json, hashlib
+
+# 既存実装をエイリアス保存（LLMで上書きする前に退避）
+_rule_detect_category = detect_category
+_rule_build_filename = build_filename
+
+# OpenAI クライアント（未インストール/未設定でも安全にフォールバック）
+try:
+    from openai import OpenAI  # pip install openai>=1.0.0
+    _OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+    _OPENAI = OpenAI(api_key=_OPENAI_API_KEY) if _OPENAI_API_KEY else None
+except Exception:
+    _OPENAI = None
+
+# モデルは環境変数で差し替え可能（例: OPENAI_MODEL=o3-mini または gpt-4o-mini）
+_OPENAI_MODEL = (
+    os.environ.get("OPENAI_MODEL")
+    or os.environ.get("OPENAI_GPT_MINI_MODEL")
+    or "gpt-4o-mini"
+)
+
+# LLMキャッシュ（同一文面の二重呼び出し回避）
+_LLM_CACHE: dict[str, dict] = {}
+
+def _ckey(text: str) -> str:
+    norm = normalize_text(text or "")
+    return hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16]
+
+_ALLOWED_CATEGORIES = list(NAMING_TEMPLATES.keys()) + ["その他"]
+
+# 構造化出力スキーマ（JSON Schema）
+_JSON_SCHEMA = {
+    "name": "DocDecision",
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "category": {"type": "string", "enum": _ALLOWED_CATEGORIES},
+            "patient": {"type": "string"},
+            "doctor": {"type": "string"},
+            "date": {"type": "string", "pattern": r"^\d{8}$"},  # YYYYMMDD
+            "clinic": {"type": "string"},
+            "staff": {"type": "string"},
+            "suggested_filename": {"type": "string"},  # 拡張子なし（後で付与）
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        },
+        "required": ["category", "suggested_filename", "confidence"],
+    },
+    "strict": True,
+}
+
+_SYSTEM = (
+    "You are a careful Japanese document classifier and filename generator for noisy OCR text. "
+    "Return ONLY valid JSON matching the schema. "
+    "Filename must be a BASE NAME (no extension), avoid \\ / : * ? \" < > | and newlines. "
+    "Prefer clinic/patient/doctor/date cues and follow the given rule hints when they look reliable."
+)
+
+def _llm_enabled() -> bool:
+    return _OPENAI is not None
+
+def _llm_decide(text: str) -> dict | None:
+    """LLMで {category, suggested_filename, fields..., confidence} を返す。失敗時は None。"""
+    if not _llm_enabled():
+        return None
+
+    key = _ckey(text)
+    if key in _LLM_CACHE:
+        return _LLM_CACHE[key]
+
+    # 既存ルールからのヒント（LLMに渡して整合性を高める）
+    rule_hints = {
+        "rule_category": _rule_detect_category(text),
+        "rule_patient": extract_patient(text),
+        "rule_doctor": extract_doctor(text),
+        "rule_date": extract_date(text),
+    }
+
+    user_prompt = (
+        "以下のOCRテキストからカテゴリとファイル名を決めてください。\n"
+        f"- カテゴリは次から1つ: {', '.join(_ALLOWED_CATEGORIES)}\n"
+        "- ファイル名は拡張子を含めないベース名。禁止文字(\\ / : * ? \" < > |)なし。\n"
+        "- 可能なら patient/doctor/date(YYYYMMDD)/clinic/staff も埋めてください（不明なら空文字）。\n"
+        "- 次のルール結果は“参考ヒント”です。矛盾があればOCR本文を優先:\n"
+        + json.dumps(rule_hints, ensure_ascii=False)
+        + "\n--- OCR ---\n"
+        + (text or "")
+    )
+
+    try:
+        resp = _OPENAI.responses.create(
+            model=_OPENAI_MODEL,
+            input=[
+                {"role": "system", "content": [{"type": "text", "text": _SYSTEM}]},
+                {"role": "user", "content": [{"type": "text", "text": user_prompt}]},
+            ],
+            response_format={"type": "json_schema", "json_schema": _JSON_SCHEMA},
+        )
+        try:
+            data = resp.output_parsed  # SDK>=1.0
+        except Exception:
+            # 念のためテキストからの手動パースも試みる
+            txt = getattr(resp, "output_text", "") or ""
+            data = json.loads(txt) if txt.strip().startswith("{") else None
+    except Exception:
+        data = None
+
+    if isinstance(data, dict):
+        # サニタイズ
+        data["category"] = data.get("category") or "その他"
+        data["suggested_filename"] = _sanitize_filename(data.get("suggested_filename", ""))
+        data["confidence"] = float(data.get("confidence", 0))
+        _LLM_CACHE[key] = data
+        return data
+    return None
+
+def detect_category(text: str) -> str:
+    """LLM優先でカテゴリ決定。自信が薄い/不整合なら既存ルールへフォールバック。"""
+    ans = _llm_decide(text)
+    if ans and ans.get("category") in _ALLOWED_CATEGORIES:
+        conf = ans.get("confidence", 0.0)
+        # 低信頼はルールへ
+        if conf < 0.55:
+            return _rule_detect_category(text)
+        # 強シグナル（治療報告書/請求書）と矛盾時の保守判断
+        rule_cat = _rule_detect_category(text)
+        if rule_cat in {"治療報告書", "請求書"} and ans["category"] != rule_cat and conf < 0.75:
+            return rule_cat
+        return ans["category"]
+    return _rule_detect_category(text)
+
+def build_filename(category: str, patient: str, doctor: str, date_str: str, ext: str, text: str) -> str:
+    """
+    LLMの命名案を最優先。なければ従来テンプレへフォールバック。
+    ext は必ず末尾に1回だけ付与。
+    """
+    ans = _llm_decide(text)
+    if ans and ans.get("suggested_filename"):
+        base = ans["suggested_filename"].strip()
+        if not base:
+            return _rule_build_filename(category, patient, doctor, date_str, ext, text)
+        # もしLLMが誤って拡張子を付けた場合は剥がす
+        if base.lower().endswith(ext.lower()):
+            base = base[: -len(ext)]
+        name = _compact(base)
+        MAX_BASENAME = 80
+        if len(name) > MAX_BASENAME:
+            name = name[:MAX_BASENAME].rstrip("_ ").rstrip()
+        return f"{name}{ext}"
+    # フォールバック
+    return _rule_build_filename(category, patient, doctor, date_str, ext, text)
