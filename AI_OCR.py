@@ -32,6 +32,8 @@ import json
 import time
 import uuid
 import base64
+import hashlib
+import unicodedata
 from datetime import datetime
 from urllib.parse import quote
 
@@ -146,7 +148,130 @@ def gsheet_append_rows(rows: list[list[str]]):
             detail = ""
         print(f"[WARN] Sheets append failed: {r.status_code} {detail}")
 
+# ---------- 治療報告書：OCRパーサ & 高精度命名 ----------
+def _norm(s: str) -> str:
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFKC", s)
+    # 空白（半角/全角/タブ）除去
+    s = re.sub(r"[ \u3000\t]+", "", s)
+    # 禁止文字を置換
+    s = re.sub(r'[\\/:*?"<>|]', "_", s)
+    # 連続 "_" を縮約
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
 
+def _hash6(*parts) -> str:
+    h = hashlib.sha1(("|".join(parts)).encode("utf-8")).hexdigest()
+    return h[:6]
+
+def build_filename_treatment_report(meta: dict, ext: str = ".pdf") -> str:
+    """
+    固定順命名:
+      {患者名}_{YYYY-MM}_治療報告書_{治療院名}_{スタッフ名}_{市区}_{事業所名}_{作成日時YYYYMMDD-HHMMSS}{ext}
+    """
+    patient = _norm(meta.get("patient", ""))
+    clinic  = _norm(meta.get("clinic", ""))
+    staff   = _norm(meta.get("staff", ""))
+    city    = _norm(meta.get("city", ""))
+    office  = _norm(meta.get("office", ""))
+
+    # YYYY-MM
+    yyyymm = None
+    for src in [meta.get("period_start"), meta.get("created_at")]:
+        if src:
+            m = re.search(r"(\d{4})[-/](\d{2})", src)
+            if m:
+                yyyymm = f"{m.group(1)}-{m.group(2)}"; break
+    if not yyyymm:
+        yyyymm = datetime.now().strftime("%Y-%m")
+
+    # 作成日時スタンプ
+    ts = meta.get("created_at") or ""
+    m = re.search(r"(\d{4})[-/](\d{2})[-/](\d{2}).*?(\d{2}):(\d{2}):(\d{2})", ts)
+    stamp = f"{m.group(1)}{m.group(2)}{m.group(3)}-{m.group(4)}{m.group(5)}{m.group(6)}" if m else ""
+
+    parts = [patient, yyyymm, "治療報告書", clinic, staff, city, office, stamp]
+    parts = [p for p in parts if p]
+    name = "_".join(parts) + (ext if ext.startswith(".") else f".{ext}")
+
+    # 長い場合、office を短縮＋ハッシュで衝突回避
+    if len(name) > 120:
+        short_office = (office[:12] + "…" if len(office) > 13 else office)
+        hx = _hash6(patient, yyyymm, clinic, staff, city, office, stamp)
+        parts2 = [patient, yyyymm, "治療報告書", clinic, staff, city, short_office + "_" + hx, stamp]
+        parts2 = [p for p in parts2 if p]
+        name = "_".join(parts2) + (ext if ext.startswith(".") else f".{ext}")
+    return name
+
+def parse_meta_from_tiryo_houkokusho(text: str) -> dict:
+    """
+    OCR結果から治療報告書の主要メタを抽出（全半角/改行/ラベル崩れにロバスト）
+    """
+    t = unicodedata.normalize("NFKC", text or "")
+    t_space = re.sub(r"\s+", " ", t).strip()
+
+    # 1) 期間
+    period_start = period_end = ""
+    m = re.search(r"(\d{4}[-/]\d{2}[-/]\d{2})\s*[-〜~]\s*(\d{4}[-/]\d{2}[-/]\d{2})", t_space)
+    if m:
+        period_start, period_end = m.group(1), m.group(2)
+
+    # 2) 作成日時
+    created_at = ""
+    m = re.search(r"作成日時\s*[:：]?\s*(\d{4}[-/]\d{2}[-/]\d{2})\s+(\d{2}:\d{2}:\d{2})", t_space)
+    if m:
+        created_at = f"{m.group(1)} {m.group(2)}"
+
+    # 3) 治療院名・スタッフ名・患者名（期間の直後～最初の「様」まで）
+    clinic = staff = patient = ""
+    tail = t_space
+    if period_end:
+        idx = t_space.find(period_end)
+        if idx >= 0:
+            tail = t_space[idx + len(period_end):].strip()
+    idx_sama = tail.find("様")
+    head = tail[:idx_sama] if idx_sama != -1 else tail
+    toks = [x for x in head.split(" ") if x]
+    if len(toks) >= 2:
+        patient = toks[-1]
+        staff   = toks[-2]
+        clinic  = " ".join(toks[:-2]).strip()
+        # 混入するラベル文言を除去
+        clinic  = re.sub(r"(治療報告書|報告対象年月|治療院名|スタッフ名|患者様氏名|所|患者様住)+", "", clinic).strip()
+
+    # 4) 市区・事業所名（「事業所名 … 御中」区間）
+    city = ""
+    office = ""
+    idx_onchu = t_space.find("御中")
+    idx_offlbl = t_space.find("事業所名")
+    if idx_offlbl != -1 and idx_onchu != -1 and idx_offlbl < idx_onchu:
+        seg = t_space[idx_offlbl + len("事業所名"): idx_onchu]
+        seg = re.sub(r"(町村|配布先担当者|様)+", " ", seg).strip()
+        seg_toks = [x for x in seg.split(" ") if x]
+        for i, tok in enumerate(seg_toks):
+            if tok.endswith(("市", "区", "町", "村")):
+                city = tok
+                office = " ".join(seg_toks[i+1:]).strip()
+                break
+        if not office and seg_toks:
+            office = " ".join(seg_toks).strip()
+    else:
+        # フォールバック
+        pre = t_space[:idx_onchu] if idx_onchu != -1 else t_space
+        for tok in pre.split(" "):
+            if tok.endswith(("市", "区", "町", "村")):
+                city = tok
+        m_off = re.search(r"([^\s]{2,50})\s*御中", t_space)
+        if m_off:
+            office = m_off.group(1)
+
+    return {
+        "patient": patient, "clinic": clinic, "staff": staff,
+        "city": city, "office": office,
+        "period_start": period_start, "period_end": period_end,
+        "created_at": created_at,
+    }
 
 # ---------- OCR (Images via Vision) ----------
 def ocr_image_bytes(image_bytes: bytes) -> str:
@@ -268,7 +393,6 @@ def category_folder(category: str) -> str:
     if mapped:
         return f"{ONEDRIVE_BASE_FOLDER.rstrip('/')}/{mapped}"
     return f"{ONEDRIVE_BASE_FOLDER.rstrip('/')}/その他"
-
 
 # ---------- Microsoft Graph (OneDrive) ----------
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
@@ -413,8 +537,8 @@ def onedrive_search(query: str, max_items=5, allowed_ext=(".pdf", ".jpg", ".jpeg
         if len(results) >= max_items:
             break
     return results
-# --- 追加: ファイル名の一部完全一致マッチ用ユーティリティ＆検索 ---
 
+# --- 追加: ファイル名の一部完全一致マッチ用ユーティリティ＆検索 ---
 def _normalize_person(s: str) -> str:
     """比較用に空白類を除去（半角/全角対応）。"""
     return re.sub(r"[ \u3000\t]", "", s or "")
@@ -453,7 +577,6 @@ def onedrive_search_by_filename_exact_token(person: str, max_items: int = 5, poo
             if len(results) >= max_items:
                 break
     return results
-
 
 # ---------- LINE Routes ----------
 @app.route("/", methods=["GET"])
@@ -503,7 +626,15 @@ def handle_image(event: MessageEvent):
         # 4) 保存先・命名
         folder = category_folder(category)
         ensure_folder(folder)
-        filename = build_filename(category, patient, doctor, date_str, ext=".jpg", text=text)
+
+        # ★ 治療報告書は専用パーサ＆命名で高精度化
+        if category == "治療報告書":
+            meta = parse_meta_from_tiryo_houkokusho(text)
+            filename = build_filename_treatment_report(meta, ext=".jpg")
+        else:
+            filename = build_filename(category, patient, doctor, date_str, ext=".jpg", text=text)
+
+        filename = uniquify_filename(folder, filename)
 
         # 5) OneDriveへ保存
         if len(image_bytes) <= 4 * 1024 * 1024:
@@ -584,7 +715,15 @@ def handle_file(event: MessageEvent):
             # 4) 保存先・命名
             folder = category_folder(category)
             ensure_folder(folder)
-            filename = build_filename(category, patient, doctor, date_str, ext=".pdf", text=text)
+
+            # ★ 治療報告書は専用パーサ＆命名で高精度化
+            if category == "治療報告書":
+                meta = parse_meta_from_tiryo_houkokusho(text)
+                filename = build_filename_treatment_report(meta, ext=".pdf")
+            else:
+                filename = build_filename(category, patient, doctor, date_str, ext=".pdf", text=text)
+
+            filename = uniquify_filename(folder, filename)
 
             # 5) OneDriveへ保存
             if len(pdf_bytes) <= 4 * 1024 * 1024:
